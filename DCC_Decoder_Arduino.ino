@@ -320,16 +320,16 @@ void selftestTask(void)
       //all to the left
       case 12:
         servoTaskActive = true;
-        setSelectedServoPos(1, false);
+        setSelectedServoPos(1, false, false);
         break;
-      case 13: setSelectedServoPos(2, false); break;
-      case 14: setSelectedServoPos(3, false); break;
-      case 15: setSelectedServoPos(4, false); break;
+      case 13: setSelectedServoPos(2, false, false); break;
+      case 14: setSelectedServoPos(3, false, false); break;
+      case 15: setSelectedServoPos(4, false, false); break;
       //all to the right
-      case 16: setSelectedServoPos(1, true); break;
-      case 17: setSelectedServoPos(2, true); break;
-      case 18: setSelectedServoPos(3, true); break;
-      case 19: setSelectedServoPos(4, true); break;
+      case 16: setSelectedServoPos(1, true, false); break;
+      case 17: setSelectedServoPos(2, true, false); break;
+      case 18: setSelectedServoPos(3, true, false); break;
+      case 19: setSelectedServoPos(4, true, false); break;
       // end this sequence
       case 20:
         selftestRunning = false;
@@ -502,7 +502,7 @@ void getSerialTokens(void)
   #endif
 }
 
-void setSelectedServoPos(int selServo, bool newValue)
+void setSelectedServoPos(int selServo, bool newValue, bool saveState)
 {
   int counterValue = 20;
   switch (selServo)
@@ -534,6 +534,10 @@ void setSelectedServoPos(int selServo, bool newValue)
   Serial.print(selServo);
   Serial.print(" to new pos = ");
   Serial.println(newValue ? "true" : "false");
+  if (saveState)
+  {
+    saveToEEprom();
+  }
 }
 
 void setSelectedServoMax(int selServo, int newValue)
@@ -601,7 +605,7 @@ void analyseSerialCommand(void)
       {
         setSelectedServoMax(value1, serialTokens[2]->toInt());
         setSelectedServoVal(value1, serialTokens[2]->toInt());
-        setSelectedServoPos(value1, false);
+        setSelectedServoPos(value1, false, false);
       }
     }
     else if (serialTokens[0]->equals("min"))
@@ -610,7 +614,7 @@ void analyseSerialCommand(void)
       {
         setSelectedServoMin(value1, serialTokens[2]->toInt());
         setSelectedServoVal(value1, serialTokens[2]->toInt());
-        setSelectedServoPos(value1, true);
+        setSelectedServoPos(value1, true, false);
       }
     }
     else if (serialTokens[0]->equals("val"))
@@ -624,7 +628,7 @@ void analyseSerialCommand(void)
     {
       if ((1 <= value1) && (5 >= value1))
       {
-        setSelectedServoPos(value1, serialTokens[2]->toInt());
+        setSelectedServoPos(value1, serialTokens[2]->toInt(), false);
       }
     }
     else if (serialTokens[0]->equals("adr"))
@@ -714,7 +718,7 @@ void scanI2CBus(void)
 {
   byte error, address;
   int nDevices;
-  Serial.println("Scanning...");
+  Serial.println("Scanning I2C...");
   nDevices = 0;
   for (address = 1; address < 127; address++ )
   {
@@ -728,8 +732,7 @@ void scanI2CBus(void)
       Serial.print("I2C device found at address 0x");
       if (address < 16)
         Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println("  !");
+      Serial.println(address, HEX);
       nDevices++;
     }
     else if (error == 4)
@@ -743,7 +746,7 @@ void scanI2CBus(void)
   if (nDevices == 0)
     Serial.println("No I2C devices found\n");
   else
-    Serial.println("done\n");
+    Serial.println("done.\n");
 
   I2CWrite(0x20, 0xff);
 }
@@ -764,8 +767,7 @@ void dccInterfaceTask(void)
         accCmd.position == 1 ? Serial.print(" +") : Serial.print(" -");
         if (accCmd.activate) Serial.print("; Activate!");
         Serial.println("");
-        setSelectedServoPos(accCmd.turnout, accCmd.position == 1);
-        saveToEEprom();
+        setSelectedServoPos(accCmd.turnout, accCmd.position == 1, true);
         break;
       case Dcc::AnyAccessoryCmd :
         Serial.print(accCmd.decoderAddress);
@@ -978,6 +980,7 @@ void progButtonTask(void)
       {
         selectedServo = 0;
         decoderState = stateIdle;
+        saveToEEprom();
       }
       Serial.print("Prog. Button edge detected. SelectedServo = ");
       Serial.println(selectedServo);
@@ -995,10 +998,10 @@ void modifySelServo(int servo, bool upperLimit, bool up)
   {
     switch (servo)
     {
-      case 1: servoData.max1 += delta; setSelectedServoPos(1, false); break;
-      case 2: servoData.max2 += delta; setSelectedServoPos(2, false); break;
-      case 3: servoData.max3 += delta; setSelectedServoPos(3, false); break;
-      case 4: servoData.max4 += delta; setSelectedServoPos(4, false); break;
+      case 1: servoData.max1 += delta; setSelectedServoPos(1, false, false); break;
+      case 2: servoData.max2 += delta; setSelectedServoPos(2, false, false); break;
+      case 3: servoData.max3 += delta; setSelectedServoPos(3, false, false); break;
+      case 4: servoData.max4 += delta; setSelectedServoPos(4, false, false); break;
       default: break;
     }
   }
@@ -1006,14 +1009,25 @@ void modifySelServo(int servo, bool upperLimit, bool up)
   {
     switch (servo)
     {
-      case 1: servoData.min1 += delta; setSelectedServoPos(1, true); break;
-      case 2: servoData.min2 += delta; setSelectedServoPos(2, true); break;
-      case 3: servoData.min3 += delta; setSelectedServoPos(3, true); break;
-      case 4: servoData.min4 += delta; setSelectedServoPos(4, true); break;
+      case 1: servoData.min1 += delta; setSelectedServoPos(1, true, false); break;
+      case 2: servoData.min2 += delta; setSelectedServoPos(2, true, false); break;
+      case 3: servoData.min3 += delta; setSelectedServoPos(3, true, false); break;
+      case 4: servoData.min4 += delta; setSelectedServoPos(4, true, false); break;
       default: break;
     }
   }
 }
+
+void modifyDeltaMove(int val)
+{
+  servoData.deltaMove += val;
+}
+
+void modifyInitDelay(int val)
+{
+  servoData.initDelay += val;
+}
+
 
 void keyboardTask()
 {
@@ -1041,14 +1055,14 @@ void keyboardTask()
       // use macro
       if (success)
       {
-        DEBOUNCE_BUTTON(bitRead(buttons, 0), S1, Serial.println("S1 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, false) : modifySelServo(selectedServo, false, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 1), S2, Serial.println("S2 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, true) : modifySelServo(selectedServo, false, false))
-        DEBOUNCE_BUTTON(bitRead(buttons, 2), S3, Serial.println("S3 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, false) : modifySelServo(selectedServo, true, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 3), S4, Serial.println("S4 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, true) : modifySelServo(selectedServo, true, false))
-        DEBOUNCE_BUTTON(bitRead(buttons, 4), S5, Serial.println("S5 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, false) : modifySelServo(selectedServo, false, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 5), S6, Serial.println("S6 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, true) : modifySelServo(selectedServo, false, false))
-        DEBOUNCE_BUTTON(bitRead(buttons, 6), S7, Serial.println("S7 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, false) : modifySelServo(selectedServo, true, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 7), S8, Serial.println("S8 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, true) : modifySelServo(selectedServo, true, false))
+        DEBOUNCE_BUTTON(bitRead(buttons, 0), S1, Serial.println("S1 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, false, true) : modifySelServo(selectedServo, false, false))
+        DEBOUNCE_BUTTON(bitRead(buttons, 1), S2, Serial.println("S2 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, true, true) : modifySelServo(selectedServo, false, true))
+        DEBOUNCE_BUTTON(bitRead(buttons, 2), S3, Serial.println("S3 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, false, true) : modifySelServo(selectedServo, true, false))
+        DEBOUNCE_BUTTON(bitRead(buttons, 3), S4, Serial.println("S4 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, true, true) : modifySelServo(selectedServo, true, true))
+        DEBOUNCE_BUTTON(bitRead(buttons, 4), S5, Serial.println("S5 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, false, true) : modifyDeltaMove(1))
+        DEBOUNCE_BUTTON(bitRead(buttons, 5), S6, Serial.println("S6 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, true, true) : modifyDeltaMove(-1))
+        DEBOUNCE_BUTTON(bitRead(buttons, 6), S7, Serial.println("S7 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, false, true) : modifyInitDelay(10))
+        DEBOUNCE_BUTTON(bitRead(buttons, 7), S8, Serial.println("S8 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, true, true) : modifyInitDelay(-10))
       }
     #undef DEBOUNCE_BUTTON
     lastKeybTaskTime = millis();
