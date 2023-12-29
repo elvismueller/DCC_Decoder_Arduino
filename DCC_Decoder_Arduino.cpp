@@ -431,23 +431,11 @@ void initialiseServos(void)
   servo2.attach(servo2Pin);
   servo3.attach(servo3Pin);
   servo4.attach(servo4Pin);
-  //activate servos
-  digitalWrite(servGnd1Pin, HIGH);
-  digitalWrite(servGnd2Pin, HIGH);
-  digitalWrite(servGnd3Pin, HIGH);
-  digitalWrite(servGnd4Pin, HIGH);
-  delay(50);
   //write given values
   servo1.writeMicroseconds(servoData.val1);
   servo2.writeMicroseconds(servoData.val2);
   servo3.writeMicroseconds(servoData.val3);
   servo4.writeMicroseconds(servoData.val4);
-  delay(50);
-  //deactivate servos again
-  digitalWrite(servGnd1Pin, LOW);
-  digitalWrite(servGnd2Pin, LOW);
-  digitalWrite(servGnd3Pin, LOW);
-  digitalWrite(servGnd4Pin, LOW);
 }
 
 void printHelp(void)
