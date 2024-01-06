@@ -10,7 +10,10 @@
 // - configuration via serial interface
 // - supports some I2C Display
 //
-// uses the DCC library from Aiko Pras (AP_DCC_library) and the display library from Oliver Kraus (U8g2lib).
+// uses:
+// - the DCC library from Aiko Pras (AP_DCC_library)
+// - the display library from Oliver Kraus (U8g2lib).
+// - the statistic library from Rob Tillaart
 //
 // Copyright 1992-2022 The FreeBSD Project. All rights reserved.
 //
@@ -51,10 +54,18 @@
 #include <EEPROM.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "Statistic.h"
 
 // configure the display (AZDelivery 0,96 Zoll OLED Display I2C SSD1306 Chip 128 x 64)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 unsigned long lastDisplayTime = 0;
+
+enum displayStatusEnum
+  { displayStatus_clear
+  , displayStatus_fill
+  , displayStatus_show
+  };
+displayStatusEnum displayStatus = displayStatus_clear;
 
 const uint8_t dccPin = 2;
 const uint8_t progBtnPin = 3;
@@ -83,9 +94,9 @@ unsigned long lastServoTime = 0;
 uint16_t ledPattern = 0x0101;
 int ledCount = 0;
 enum decoderStates
-{ stateIdle
+  { stateIdle
   , stateSelection
-};
+  };
 decoderStates decoderState = stateIdle;
 unsigned long lastLedTime = 0;
 int eepromResetValue = 0xAA;
@@ -96,6 +107,8 @@ bool servoTaskActive = true;
 unsigned long lastSelftestTime = 0;
 int selftestIteration = 0;
 bool selftestRunning = false;
+
+bool debugMode = false;
 
 int resetAddress = 0;
 int dataAddress = 10;
@@ -149,14 +162,14 @@ int posCounter4 = 0;
 int progBtnPinCount = 5;
 bool progBtnPinActive = false;
 bool progBtnPinActiveOld = false;
-#define DEBOUNCE_LIMIT 22
+#define DEBOUNCE_LIMIT 10
 #define DEBOUNCE_LEVEL DEBOUNCE_LIMIT/2
 unsigned long lastProgBtnTaskTime = 0;
 
 #define ADD_BUTTON(name)            \
   bool btnActive##name = false;     \
   bool btnActiveOld##name = false;  \
-  int btnCount##name = false;
+  int btnCount##name = 0;
 // use macro
 ADD_BUTTON(S1);
 ADD_BUTTON(S2);
@@ -173,7 +186,28 @@ bool frogRelay2On = false;
 bool frogRelay3On = false;
 bool frogRelay4On = false;
 
-// Definitions
+// some statistics
+statistic::Statistic<float, uint32_t, false> loopOverallStats;
+unsigned long loopOverallLastCallTime = 0;
+// ... for tasks
+statistic::Statistic<float, uint32_t, false> dccInterfaceTaskStats;
+unsigned long dccInterfaceTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> servoTaskStats;
+unsigned long servoTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> ledTaskStats;
+unsigned long ledTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> serialInterfaceTaskStats;
+unsigned long serialInterfaceTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> selftestTaskStats;
+unsigned long selftestTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> displayTaskStats;
+unsigned long displayTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> progButtonTaskStats;
+unsigned long progButtonTaskLastCallTime = 0;
+statistic::Statistic<float, uint32_t, false> keyboardTaskStats;
+unsigned long keyboardTaskLastCallTime = 0;
+
+// definitions
 void saveToEEprom();
 void resetServoData();
 void printServoData(int servo);
@@ -200,6 +234,7 @@ void scanI2CBus();
 void dccInterfaceTask();
 void servoTask();
 void displayTask();
+void displayFillContent();
 void progButtonTask();
 void modifySelServo(int servo, bool upperLimit, bool up);
 void modifyDeltaMove(int val);
@@ -476,16 +511,18 @@ void initialiseServos()
 void printHelp()
 {
   Serial.println("available commands (followed by enter):");
-  Serial.println("| set;<type>;<servo_nr>;<value> ... set some servo values");
-  Serial.println("|   type=min: minimum servo position");
-  Serial.println("|   type=max: maximum servo position");
-  Serial.println("|   type=val: actual servo position");
-  Serial.println("| set;<type>;<value> .............. set other values");
-  Serial.println("|   type=adr: first adress of servo");
-  Serial.println("|   type=dlt: microsecs per step (50ms)");
-  Serial.println("|   type=dly: initial delay [ms]");
-  Serial.println("| slv ............................. start selftest");
-  Serial.println("| rst ............................. reset servo data");
+  Serial.println("set;<type>;<servo_nr>;<value> ... set some servo values");
+  Serial.println("  type=min: minimum servo position");
+  Serial.println("  type=max: maximum servo position");
+  Serial.println("  type=val: actual servo position");
+  Serial.println("set;<type>;<value> .............. set other values");
+  Serial.println("  type=adr: first adress of servo");
+  Serial.println("  type=dlt: microsecs per step (50ms)");
+  Serial.println("  type=dly: initial delay [ms]");
+  Serial.println("slv ............................. start selftest");
+  Serial.println("rst ............................. reset servo data");
+  Serial.println("dbg ............................. debug mode");
+  Serial.println("dbr ............................. reset statistic");
 }
 
 void getSerialTokens()
@@ -527,7 +564,7 @@ void getSerialTokens()
 
 void setSelectedServoPos(int selServo, bool newValue, bool saveState)
 {
-  int counterValue = 20;
+  int counterValue = 5;
   switch (selServo)
   {
     case 1:
@@ -683,13 +720,38 @@ void analyseSerialCommand(void)
     selftestIteration = 0;
     selftestRunning = true;
   }
+  else if (serialBuffer.startsWith("dbg"))
+  {
+    debugMode ? debugMode = false : debugMode = true;
+    Serial.print("debug mode = ");
+    Serial.println(debugMode ? "ON" : "OFF");
+  }
+  else if (serialBuffer.startsWith("dbr"))
+  { // reset statistics
+    loopOverallStats.clear();
+    dccInterfaceTaskStats.clear();
+    servoTaskStats.clear();
+    ledTaskStats.clear();
+    serialInterfaceTaskStats.clear();
+    selftestTaskStats.clear();
+    displayTaskStats.clear();
+    progButtonTaskStats.clear();
+    keyboardTaskStats.clear();
+  }
   else if (serialBuffer.startsWith("rst"))
   {
     resetServoData();
   }
   else
   {
-    Serial.println("Unknown Command!");
+    if (serialBuffer.startsWith("\n") || serialBuffer.startsWith("\r"))
+    {
+      //nothing to do
+    }
+    else
+    {
+      Serial.println("Unknown Command!");
+    }
   }
 }
 
@@ -811,38 +873,31 @@ void servoTask()
   if (((millis() - lastServoTime ) > 50) && servoTaskActive)
   {
     // define macro
-    #define careServo(number, direction, position)                                                                                        \
-      if (servoData.pos##number == position)                                                                                              \
-      {                                                                                                                                   \
-        if (0 < posCounter##number)                                                                                                       \
-        {                                                                                                                                 \
-          posCounter##number--;                                                                                                           \
-        }                                                                                                                                 \
-        else                                                                                                                              \
-        {                                                                                                                                 \
-          if (abs(servoData.val##number - servoData.direction##number) < servoData.deltaMove)                                             \
-          {                                                                                                                               \
-            servoData.moving##number = false;                                                                                             \
-            servoData.val##number = servoData.direction##number;                                                                          \
-          }                                                                                                                               \
-          else if (servoData.val##number < servoData.direction##number)                                                                   \
-          {                                                                                                                               \
-            servoData.val##number += servoData.deltaMove;                                                                                 \
-            servoData.moving##number = true;                                                                                              \
-          }                                                                                                                               \
-          else                                                                                                                            \
-          {                                                                                                                               \
-            servoData.val##number -= servoData.deltaMove;                                                                                 \
-            servoData.moving##number = true;                                                                                              \
-          }                                                                                                                               \
-          if ((MIN_PULSE_WIDTH <= servoData.val##number) && (MAX_PULSE_WIDTH > servoData.val##number))                                    \
-          {                                                                                                                               \
-            servo##number.writeMicroseconds(servoData.val##number);                                                                       \
-          }                                                                                                                               \
-          frogRelay##number##On = (servoData.val##number > ((servoData.max##number + servoData.min##number)/2));                          \
-          digitalWrite(relay##number##Pin, frogRelay##number##On ? LOW : HIGH);                                                           \
-          digitalWrite(servGnd##number##Pin, servoData.moving##number ? HIGH : LOW);                                                      \
-        }                                                                                                                                 \
+    #define careServo(number, direction, position)                                                                                      \
+      if (servoData.pos##number == position)                                                                                            \
+      {                                                                                                                                 \
+        if (abs(servoData.val##number - servoData.direction##number) < servoData.deltaMove)                                             \
+        {                                                                                                                               \
+          servoData.moving##number = false;                                                                                             \
+          servoData.val##number = servoData.direction##number;                                                                          \
+        }                                                                                                                               \
+        else if (servoData.val##number < servoData.direction##number)                                                                   \
+        {                                                                                                                               \
+          if (0 < posCounter##number) { posCounter##number--; } else { servoData.val##number += servoData.deltaMove; }                  \
+          servoData.moving##number = true;                                                                                              \
+        }                                                                                                                               \
+        else                                                                                                                            \
+        {                                                                                                                               \
+          if (0 < posCounter##number) { posCounter##number--; } else { servoData.val##number -= servoData.deltaMove; }                  \
+          servoData.moving##number = true;                                                                                              \
+        }                                                                                                                               \
+        if ((MIN_PULSE_WIDTH <= servoData.val##number) && (MAX_PULSE_WIDTH > servoData.val##number))                                    \
+        {                                                                                                                               \
+          servo##number.writeMicroseconds(servoData.val##number);                                                                       \
+        }                                                                                                                               \
+        frogRelay##number##On = (servoData.val##number > ((servoData.max##number + servoData.min##number)/2));                          \
+        digitalWrite(relay##number##Pin, frogRelay##number##On ? LOW : HIGH);                                                           \
+        digitalWrite(servGnd##number##Pin, servoData.moving##number ? HIGH : LOW);                                                      \
       }
       // use macro, one for each direction
       careServo(1, min, true);
@@ -861,111 +916,159 @@ void servoTask()
 
 void displayTask()
 {
-  static unsigned int aLiveClockCounter = 0;
-  if ((millis() - lastDisplayTime) > 500)
+  if (servoData.moving1 || servoData.moving2 || servoData.moving3 || servoData.moving4)
   {
-    u8g2.clearBuffer();
-    if (selftestRunning)
+    return;
+  }
+  else if ((millis() - lastDisplayTime) > 300)
+  {
+    switch (displayStatus)
     {
-      u8g2.drawStr(0,  8, "Selftest running...");
-      if (4 > selftestIteration) {
-        u8g2.drawStr(0,  30, "> Intro");
-      }
-      else if (8 > selftestIteration) {
-        u8g2.drawStr(0,  30, "> all relay left");
-      }
-      else if (12 > selftestIteration) {
-        u8g2.drawStr(0,  30, "> all relay right");
-      }
-      else if (16 > selftestIteration) {
-        u8g2.drawStr(0,  30, "> all pos false");
-      }
-      else {
-        u8g2.drawStr(0,  30, "> all pos true");
-      }
-      char iterationStr[20]; snprintf(iterationStr, 20, "%d", selftestIteration); u8g2.drawStr(0,  45, iterationStr);
+      case displayStatus_clear:
+        u8g2.clearBuffer();
+        displayStatus = displayStatus_fill;
+        break;
+      case displayStatus_fill:
+        displayFillContent();
+        displayStatus = displayStatus_show;
+        break;
+      case displayStatus_show:
+        u8g2.sendBuffer();
+        displayStatus = displayStatus_clear;
+        break;
+    }
+    lastDisplayTime = millis();
+  }
+}
+
+void displayFillContent()
+{
+  static unsigned int aLiveClockCounter = 0;
+  static u8g2_uint_t dw = u8g2.getWidth();
+  static u8g2_uint_t dw2 = u8g2.getWidth() / 2;
+
+  if (debugMode)
+  { // show debug screen
+    #define SHOW_STATS_FOR(name, title, x_value, y_value, width)                                         \
+      u8g2.drawStr(x_value, y_value, title);                                                             \
+      char name##StatsStr[20];                                                                           \
+      if      (0 == aLiveClockCounter % 3) { dtostrf(name##Stats.average(),     8, 0, name##StatsStr); } \
+      else if (1 == aLiveClockCounter % 3) { dtostrf(name##Stats.maximum(),     8, 0, name##StatsStr); } \
+      else if (2 == aLiveClockCounter % 3) { dtostrf(name##Stats.minimum(),     8, 0, name##StatsStr); } \
+      u8g2.drawStr(width - u8g2.getStrWidth(name##StatsStr), y_value, name##StatsStr);
+    // use macro
+    SHOW_STATS_FOR(loopOverall,         "OV",   0,   12, dw2-5);
+    SHOW_STATS_FOR(dccInterfaceTask,    "DCC",  0,   22, dw2-5);
+    SHOW_STATS_FOR(servoTask,           "SERV", 0,   32, dw2-5);
+    SHOW_STATS_FOR(ledTask,             "LED",  0,   42, dw2-5);
+    SHOW_STATS_FOR(serialInterfaceTask, "COM",  0,   52, dw2-5);
+    SHOW_STATS_FOR(selftestTask,        "SELF", dw2, 22, dw   );
+    SHOW_STATS_FOR(displayTask,         "DIS",  dw2, 32, dw   );
+    SHOW_STATS_FOR(progButtonTask,      "PRG",  dw2, 42, dw   );
+    SHOW_STATS_FOR(keyboardTask,        "KEY",  dw2, 52, dw   );
+    // show the type
+    char typeStr[10];
+    if      (0 == aLiveClockCounter % 3) { snprintf(typeStr, 10, "%s", "AVG [us]"); }
+    else if (1 == aLiveClockCounter % 3) { snprintf(typeStr, 10, "%s", "MAX [us]"); }
+    else if (2 == aLiveClockCounter % 3) { snprintf(typeStr, 10, "%s", "MIN [us]"); }
+    u8g2.drawStr(dw - u8g2.getStrWidth(typeStr), 10, typeStr);
+  }
+  else if (selftestRunning)
+  { // show selftest screen
+    u8g2.drawStr(0,  8, "Selftest running...");
+    if (4 > selftestIteration) {
+      u8g2.drawStr(0,  30, "> Intro");
+    }
+    else if (8 > selftestIteration) {
+      u8g2.drawStr(0,  30, "> all relay left");
+    }
+    else if (12 > selftestIteration) {
+      u8g2.drawStr(0,  30, "> all relay right");
+    }
+    else if (16 > selftestIteration) {
+      u8g2.drawStr(0,  30, "> all pos false");
+    }
+    else {
+      u8g2.drawStr(0,  30, "> all pos true");
+    }
+    char iterationStr[20]; snprintf(iterationStr, 20, "%d", selftestIteration); u8g2.drawStr(0,  45, iterationStr);
+  }
+  else
+  { // show the standard screen
+    // header
+    if ((0==selectedServo)||((aLiveClockCounter%2)||!(1==selectedServo))) u8g2.drawStr(0,  8, "S1__");
+    if ((0==selectedServo)||((aLiveClockCounter%2)||!(2==selectedServo))) u8g2.drawStr(32, 8, "S2__");
+    if ((0==selectedServo)||((aLiveClockCounter%2)||!(3==selectedServo))) u8g2.drawStr(64, 8, "S3__");
+    if ((0==selectedServo)||((aLiveClockCounter%2)||!(4==selectedServo))) u8g2.drawStr(96, 8, "S4__");
+    if (0 == selectedServo)
+    {
+      // show position
+      char s1PosStr[20]; snprintf(s1PosStr, 20, "%d", servoData.val1); u8g2.drawStr(0,  20, s1PosStr);
+      char s2PosStr[20]; snprintf(s2PosStr, 20, "%d", servoData.val2); u8g2.drawStr(32, 20, s2PosStr);
+      char s3PosStr[20]; snprintf(s3PosStr, 20, "%d", servoData.val3); u8g2.drawStr(64, 20, s3PosStr);
+      char s4PosStr[20]; snprintf(s4PosStr, 20, "%d", servoData.val4); u8g2.drawStr(96, 20, s4PosStr);
+      // show position
+      u8g2.drawStr(servoData.pos1 ? 0  : 5,   30, servoData.pos1 ? "||" : "//");
+      u8g2.drawStr(servoData.pos2 ? 32 : 37,  30, servoData.pos2 ? "||" : "//");
+      u8g2.drawStr(servoData.pos3 ? 64 : 69,  30, servoData.pos3 ? "||" : "//");
+      u8g2.drawStr(servoData.pos4 ? 96 : 101, 30, servoData.pos4 ? "||" : "//");
+      u8g2.drawStr(0,  40, servoData.pos1 ? "||" : "//");
+      u8g2.drawStr(32, 40, servoData.pos2 ? "||" : "//");
+      u8g2.drawStr(64, 40, servoData.pos3 ? "||" : "//");
+      u8g2.drawStr(96, 40, servoData.pos4 ? "||" : "//");
+      // show relay
+      u8g2.drawStr(0  + 20, 40, frogRelay1On ? "+" : "-");
+      u8g2.drawStr(32 + 20, 40, frogRelay2On ? "+" : "-");
+      u8g2.drawStr(64 + 20, 40, frogRelay3On ? "+" : "-");
+      u8g2.drawStr(96 + 20, 40, frogRelay4On ? "+" : "-");
     }
     else
     {
-      // header
-      if ((0==selectedServo)||((aLiveClockCounter%2)||!(1==selectedServo))) u8g2.drawStr(0,  8, "S1__");
-      if ((0==selectedServo)||((aLiveClockCounter%2)||!(2==selectedServo))) u8g2.drawStr(32, 8, "S2__");
-      if ((0==selectedServo)||((aLiveClockCounter%2)||!(3==selectedServo))) u8g2.drawStr(64, 8, "S3__");
-      if ((0==selectedServo)||((aLiveClockCounter%2)||!(4==selectedServo))) u8g2.drawStr(96, 8, "S4__");
-      if (0 == selectedServo)
-      {
-        // show position
-        char s1PosStr[20]; snprintf(s1PosStr, 20, "%d", servoData.val1); u8g2.drawStr(0,  20, s1PosStr);
-        char s2PosStr[20]; snprintf(s2PosStr, 20, "%d", servoData.val2); u8g2.drawStr(32, 20, s2PosStr);
-        char s3PosStr[20]; snprintf(s3PosStr, 20, "%d", servoData.val3); u8g2.drawStr(64, 20, s3PosStr);
-        char s4PosStr[20]; snprintf(s4PosStr, 20, "%d", servoData.val4); u8g2.drawStr(96, 20, s4PosStr);
-        // show status
-        u8g2.drawStr(0,  30, servoData.moving1 ? "mov" : "idle");
-        u8g2.drawStr(32, 30, servoData.moving2 ? "mov" : "idle");
-        u8g2.drawStr(64, 30, servoData.moving3 ? "mov" : "idle");
-        u8g2.drawStr(96, 30, servoData.moving4 ? "mov" : "idle");
-        // show target
-        u8g2.drawStr(0,  40, servoData.pos1 ? "|" : "/");
-        u8g2.drawStr(32, 40, servoData.pos2 ? "|" : "/");
-        u8g2.drawStr(64, 40, servoData.pos3 ? "|" : "/");
-        u8g2.drawStr(96, 40, servoData.pos4 ? "|" : "/");
-        // show relay
-        u8g2.drawStr(0 + 15, 40, frogRelay1On ? "on" : "--");
-        u8g2.drawStr(32 + 15, 40, frogRelay2On ? "on" : "--");
-        u8g2.drawStr(64 + 15, 40, frogRelay3On ? "on" : "--");
-        u8g2.drawStr(96 + 15, 40, frogRelay4On ? "on" : "--");
-      }
-      else
-      {
-        // show min
-        char s1MaxStr[20]; snprintf(s1MaxStr, 20, "%d", servoData.min1); u8g2.drawStr(0,  20, s1MaxStr);
-        char s2MaxStr[20]; snprintf(s2MaxStr, 20, "%d", servoData.min2); u8g2.drawStr(32, 20, s2MaxStr);
-        char s3MaxStr[20]; snprintf(s3MaxStr, 20, "%d", servoData.min3); u8g2.drawStr(64, 20, s3MaxStr);
-        char s4MaxStr[20]; snprintf(s4MaxStr, 20, "%d", servoData.min4); u8g2.drawStr(96, 20, s4MaxStr);
-        // show target
-        u8g2.drawStr(0,  30, servoData.pos1 ? "^^^" : "vvv");
-        u8g2.drawStr(32, 30, servoData.pos2 ? "^^^" : "vvv");
-        u8g2.drawStr(64, 30, servoData.pos3 ? "^^^" : "vvv");
-        u8g2.drawStr(96, 30, servoData.pos4 ? "^^^" : "vvv");
-        // show max
-        char s1MinStr[20]; snprintf(s1MinStr, 20, "%d", servoData.max1); u8g2.drawStr(0,  40, s1MinStr);
-        char s2MinStr[20]; snprintf(s2MinStr, 20, "%d", servoData.max2); u8g2.drawStr(32, 40, s2MinStr);
-        char s3MinStr[20]; snprintf(s3MinStr, 20, "%d", servoData.max3); u8g2.drawStr(64, 40, s3MinStr);
-        char s4MinStr[20]; snprintf(s4MinStr, 20, "%d", servoData.max4); u8g2.drawStr(96, 40, s4MinStr);
-      }
-      // adress, speed, initial delay
-      char adressStr[20]; snprintf(adressStr, 20, "a=%d", servoData.adress); u8g2.drawStr(0,  50, adressStr);
-      char deltaStr[20]; snprintf(deltaStr, 20, "dt=%d", servoData.deltaMove); u8g2.drawStr(32,  50, deltaStr);
-      char initDelayStr[20]; snprintf(initDelayStr, 20, "id=%d", servoData.initDelay); u8g2.drawStr(64,  50, initDelayStr);
-      char selectedStr[2] = "-";
-      if (0 == selectedServo)
-      {
-        sprintf(selectedStr, "*");
-      }
-      else
-      {
-        sprintf(selectedStr, "%d", selectedServo);
-      }
-      u8g2.drawStr(120, 50, selectedStr);
+      // show min
+      char s1MaxStr[20]; snprintf(s1MaxStr, 20, "%d", servoData.min1); u8g2.drawStr(0,  20, s1MaxStr);
+      char s2MaxStr[20]; snprintf(s2MaxStr, 20, "%d", servoData.min2); u8g2.drawStr(32, 20, s2MaxStr);
+      char s3MaxStr[20]; snprintf(s3MaxStr, 20, "%d", servoData.min3); u8g2.drawStr(64, 20, s3MaxStr);
+      char s4MaxStr[20]; snprintf(s4MaxStr, 20, "%d", servoData.min4); u8g2.drawStr(96, 20, s4MaxStr);
+      // show target
+      u8g2.drawStr(0,  30, servoData.pos1 ? "^^^" : "vvv");
+      u8g2.drawStr(32, 30, servoData.pos2 ? "^^^" : "vvv");
+      u8g2.drawStr(64, 30, servoData.pos3 ? "^^^" : "vvv");
+      u8g2.drawStr(96, 30, servoData.pos4 ? "^^^" : "vvv");
+      // show max
+      char s1MinStr[20]; snprintf(s1MinStr, 20, "%d", servoData.max1); u8g2.drawStr(0,  40, s1MinStr);
+      char s2MinStr[20]; snprintf(s2MinStr, 20, "%d", servoData.max2); u8g2.drawStr(32, 40, s2MinStr);
+      char s3MinStr[20]; snprintf(s3MinStr, 20, "%d", servoData.max3); u8g2.drawStr(64, 40, s3MinStr);
+      char s4MinStr[20]; snprintf(s4MinStr, 20, "%d", servoData.max4); u8g2.drawStr(96, 40, s4MinStr);
     }
-    // version
-    u8g2.drawStr(0, 64, "DCC");
-    u8g2.drawStr(32, 64, VERSION);
-    // turn around the clock
-    switch (aLiveClockCounter % 4)
+    // adress, speed, initial delay
+    char adressStr[20]; snprintf(adressStr, 20, "a=%d", servoData.adress); u8g2.drawStr(0,  50, adressStr);
+    char deltaStr[20]; snprintf(deltaStr, 20, "dt=%d", servoData.deltaMove); u8g2.drawStr(32,  50, deltaStr);
+    char initDelayStr[20]; snprintf(initDelayStr, 20, "id=%d", servoData.initDelay); u8g2.drawStr(64,  50, initDelayStr);
+    char selectedStr[2] = "-";
+    if (0 == selectedServo)
     {
-      case 0: u8g2.drawStr(64, 64, "|"); break;
-      case 1: u8g2.drawStr(64, 64, "/"); break;
-      case 2: u8g2.drawStr(64, 64, "-"); break;
-      case 3: u8g2.drawStr(64, 64, "\\"); break;
+      sprintf(selectedStr, "*");
     }
-    aLiveClockCounter++;
-    // me
-    u8g2.drawStr(80, 64, "(c)EMM");
-    // update buffer
-    u8g2.sendBuffer();
-    lastDisplayTime = millis();
+    else
+    {
+      sprintf(selectedStr, "%d", selectedServo);
+    }
+    u8g2.drawStr(120, 50, selectedStr);
   }
+  // version
+  u8g2.drawStr(0, 64, "DCC");
+  u8g2.drawStr(32, 64, VERSION);
+  // turn around the clock
+  switch (aLiveClockCounter % 4)
+  {
+    case 0: u8g2.drawStr(64, 64, "|"); break;
+    case 1: u8g2.drawStr(64, 64, "/"); break;
+    case 2: u8g2.drawStr(64, 64, "-"); break;
+    case 3: u8g2.drawStr(64, 64, "\\"); break;
+  }
+  // me
+  u8g2.drawStr(80, 64, "(c)EMM");
+  aLiveClockCounter++;
 }
 
 void progButtonTask()
@@ -1095,6 +1198,7 @@ void keyboardTask()
 void setup()
 {
   initialiseOutputsAndPins();
+  servoTaskStats.clear();
   // initialize serial communication at 115200 bits per second:
   Serial.begin(115200);
   // say hello on UART
@@ -1108,21 +1212,38 @@ void setup()
   // some decoder data
   accCmd.myMaster = Roco;
   accCmd.setMyAddress(servoData.adress);
+  // init I2C
+  scanI2CBus();
   //wait some defined time before servos are activated
   delay(servoData.initDelay);
   initialiseServos();
-  scanI2CBus();
 }
+
+#define CALL_TASK_WITH_STATS(name)                        \
+  unsigned long name##TimeMeas = micros();                \
+  name();                                                 \
+  name##TimeMeas = micros() - name##TimeMeas;             \
+  name##Stats.add(static_cast<float>(name##TimeMeas));    \
+  name##LastCallTime = name##TimeMeas;
 
 void loop()
 {
-  dccInterfaceTask();
-  servoTask();
-  ledTask();
-  serialInterfaceTask();
-  selftestTask();
-  displayTask();
-  progButtonTask();
-  keyboardTask();
+  // loop statistics
+  unsigned long loopOverallTimeMeas = micros();
+
+  // all tasks
+  CALL_TASK_WITH_STATS(dccInterfaceTask);
+  CALL_TASK_WITH_STATS(servoTask);
+  CALL_TASK_WITH_STATS(ledTask);
+  CALL_TASK_WITH_STATS(serialInterfaceTask);
+  CALL_TASK_WITH_STATS(selftestTask);
+  CALL_TASK_WITH_STATS(displayTask);
+  CALL_TASK_WITH_STATS(progButtonTask);
+  CALL_TASK_WITH_STATS(keyboardTask);
+
+  // loop statistics
+  loopOverallTimeMeas = micros() - loopOverallTimeMeas;
+  loopOverallStats.add(static_cast<float>(loopOverallTimeMeas));
+  loopOverallLastCallTime = loopOverallTimeMeas;
 }
 
