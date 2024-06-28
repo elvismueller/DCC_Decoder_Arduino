@@ -43,9 +43,14 @@
 //     - implement external buttons via I2C bua
 //     - show status in display
 //     - debug mode and statistic, add middle pos in program mode, fix workflow, fix display
+//   2024_06_28 V1.2 EMM: Servo options, display improvement
+//     - add error handling, improve validation
+//     - add turnout type and care display
+//     - add servo mode, new menu structure
+//     - reduce code size
 //
 //******************************************************************************************************
-#define VERSION "v1.1"
+#define VERSION "v1.2"
 #define DESCSTR1 "DCC tournout decoder"
 #define DESCSTR2 "(c)EMM"
 
@@ -59,7 +64,6 @@
 
 // configure the display (AZDelivery 0,96 Zoll OLED Display I2C SSD1306 Chip 128 x 64)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-unsigned long lastDisplayTime = 0;
 
 enum displayStatusEnum
   { displayStatus_clear
@@ -68,30 +72,25 @@ enum displayStatusEnum
   };
 displayStatusEnum displayStatus = displayStatus_clear;
 
+enum errorEnum
+  { error_none
+  , error_readEepromFailed
+  , error_validationFailed
+  , error_validationFixed
+  };
+errorEnum error = error_none;
+
 const uint8_t dccPin = 2;
 const uint8_t progBtnPin = 3;
-const uint8_t servo1Pin = 14;
-const uint8_t servo2Pin = 15;
-const uint8_t servo3Pin = 16;
-const uint8_t servo4Pin = 17;
-const uint8_t servGnd1Pin = 4;
-const uint8_t relay1Pin = 5;
-const uint8_t servGnd2Pin = 6;
-const uint8_t relay2Pin = 7;
-const uint8_t servGnd3Pin = 9;
-const uint8_t relay3Pin = 10;
-const uint8_t servGnd4Pin = 20;
-const uint8_t relay4Pin = 21;
+const uint8_t servoPin[4] = {14, 15, 16, 17};
+const uint8_t servGndPin[4] = {4, 6, 9, 20};
+const uint8_t relayPin[4] = {5, 7, 10, 21};
 
 extern Dcc dcc;                  // This object is instantiated in DCC_Library.cpp
 extern Accessory accCmd;         // To retrieve data from accessory commands
 
-Servo servo1;
-Servo servo2;
-Servo servo3;
-Servo servo4;
+Servo servo[4];
 
-unsigned long lastServoTime = 0;
 uint16_t ledPattern = 0x0101;
 int ledCount = 0;
 enum decoderStates
@@ -99,13 +98,19 @@ enum decoderStates
   , stateSelection
   };
 decoderStates decoderState = stateIdle;
-unsigned long lastLedTime = 0;
 int eepromResetValue = 0xAA;
+bool saveToEepromWheneverThereIsTime = false;
 int locoAdress = 9999;
 int selectedServo = 0;
+enum progPage
+  { progPageServoLimits
+  , progPageAdrDelta
+  , progPageTypeMode
+  };
+progPage selectedPage = progPageServoLimits;
 bool servoTaskActive = true;
+int initDelay = 0;
 
-unsigned long lastSelftestTime = 0;
 int selftestIteration = 0;
 bool selftestRunning = false;
 
@@ -127,56 +132,52 @@ enum servoPosition
   , servoPositionMiddle
   , servoPositionRound
   };
-servoPosition lastSelectedServoPos1 = servoPositionStraight;  
-servoPosition lastSelectedServoPos2 = servoPositionStraight;  
-servoPosition lastSelectedServoPos3 = servoPositionStraight;  
-servoPosition lastSelectedServoPos4 = servoPositionStraight;  
-#define IS_WHERE(where, nr) servoPosition##where == servoData.pos##nr
+servoPosition lastSelectedServoPos[4] = {servoPositionStraight, servoPositionStraight, servoPositionStraight, servoPositionStraight};  
+#define IS_WHERE(where, nr) servoPosition##where == servoData.servos[nr].pos
+
+enum servoModeEnum
+  { servoMode_AlwaysSignalSwitchGnd
+  , servoMode_AlwaysSignalAlwaysGnd
+  , servoMode_SwitchSignalSwitchGnd
+  , servoMode_SwitchSignalAlwaysGnd
+  };
+
+enum turnoutTypeEnum
+  { turnoutType_TurnoutRight
+  , turnoutType_TurnoutLeft
+  , turnoutType_DoubleCrossing
+  , turnoutType_SingleCrossingRight
+  , turnoutType_SingleCrossingLeft
+  };
+
+struct servoDataStructElement
+{
+  servoPosition pos = servoPositionStraight;
+  bool moving = false;
+  int min = 1200;
+  int max = 1800;
+  int val = 1200;
+  servoModeEnum servoMode = servoMode_AlwaysSignalSwitchGnd;
+  turnoutTypeEnum turnoutType = turnoutType_TurnoutRight;
+};
 
 struct servoDataStruct
 {
   int adress = 24; // Decoder 24 is switch 97..100
   int deltaMove = 20;
-
-  servoPosition pos1 = servoPositionStraight;
-  bool moving1 = false;
-  int min1 = 1200;
-  int max1 = 1800;
-  int val1 = 1200;
-
-  servoPosition pos2 = servoPositionStraight;
-  bool moving2 = false;
-  int min2 = 1200;
-  int max2 = 1800;
-  int val2 = 1200;
-
-  servoPosition pos3 = servoPositionStraight;
-  bool moving3 = false;
-  int min3 = 1200;
-  int max3 = 1800;
-  int val3 = 1200;
-
-  servoPosition pos4 = servoPositionStraight;
-  bool moving4 = false;
-  int min4 = 1200;
-  int max4 = 1800;
-  int val4 = 1200;
-
+  servoDataStructElement servos[4];
   int initDelay = 1000;
+  int checkByte = 0xAA;
 };
 servoDataStruct servoData;
 
-int posCounter1 = 0;
-int posCounter2 = 0;
-int posCounter3 = 0;
-int posCounter4 = 0;
+int posCounter[4] = {0, 0, 0, 0};
 
 int progBtnPinCount = 5;
 bool progBtnPinActive = false;
 bool progBtnPinActiveOld = false;
 #define DEBOUNCE_LIMIT 10
 #define DEBOUNCE_LEVEL DEBOUNCE_LIMIT/2
-unsigned long lastProgBtnTaskTime = 0;
 
 #define ADD_BUTTON(name)            \
   bool btnActive##name = false;     \
@@ -191,37 +192,46 @@ ADD_BUTTON(S5);
 ADD_BUTTON(S6);
 ADD_BUTTON(S7);
 ADD_BUTTON(S8);
-unsigned long lastKeybTaskTime = 0;
 
-bool frogRelay1On = false;
-bool frogRelay2On = false;
-bool frogRelay3On = false;
-bool frogRelay4On = false;
+bool frogRelayOn[4] = { false, false, false, false };
 
+typedef statistic::Statistic<float, uint32_t, false> typeStats;
 // some statistics
-statistic::Statistic<float, uint32_t, false> loopOverallStats;
+typeStats loopOverallStats;
 unsigned long loopOverallLastCallTime = 0;
 // ... for tasks
-statistic::Statistic<float, uint32_t, false> dccInterfaceTaskStats;
+typeStats dccInterfaceTaskStats;
 unsigned long dccInterfaceTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> servoTaskStats;
+typeStats servoTaskStats;
 unsigned long servoTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> ledTaskStats;
+unsigned long lastServoTime = 0;
+typeStats ledTaskStats;
 unsigned long ledTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> serialInterfaceTaskStats;
+unsigned long lastLedTime = 0;
+typeStats serialInterfaceTaskStats;
 unsigned long serialInterfaceTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> selftestTaskStats;
+typeStats selftestTaskStats;
 unsigned long selftestTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> displayTaskStats;
+unsigned long lastSelftestTime = 0;
+typeStats displayTaskStats;
 unsigned long displayTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> progButtonTaskStats;
+unsigned long lastDisplayTime = 0;
+typeStats progButtonTaskStats;
 unsigned long progButtonTaskLastCallTime = 0;
-statistic::Statistic<float, uint32_t, false> keyboardTaskStats;
+unsigned long lastProgBtnTaskTime = 0;
+typeStats keyboardTaskStats;
 unsigned long keyboardTaskLastCallTime = 0;
+unsigned long lastKeybTaskTime = 0;
+typeStats asyncMemoryTaskStats;
+unsigned long asyncMemoryTaskLastCallTime = 0;
+unsigned long lastAsyncMemoryTaskTime = 0;
 
 // definitions
 void saveToEEprom();
 void resetServoData();
+char* describeServoMode(servoModeEnum mode);
+void serialPrintServoMode(servoModeEnum mode);
+void serialPrintTurnoutType(turnoutTypeEnum turnout);
 void printServoData(int servo);
 void validateSettings();
 void readFromEEprom();
@@ -241,27 +251,58 @@ void setSelectedServoVal(int selServo, int newValue);
 void analyseSerialCommand();
 void helloUart();
 void helloDisplay();
+void showStatisticsOnSerial();
 void I2CWrite(int adress, byte data);
 byte I2CRead(int adress, bool& success);
 void scanI2CBus();
 void dccInterfaceTask();
+void careServo(int number, int target, servoPosition position);
 void servoTask();
 void displayTask();
+void displayError();
+void showTurnoutPosition(int number, u8g2_uint_t xPos, u8g2_uint_t yPos, turnoutTypeEnum type);
+void showServoMode(u8g2_uint_t xPos, u8g2_uint_t yPos, servoModeEnum mode);
 void displayFillContent();
 void progButtonTask();
 void modifySelServo(servoPosition pos, bool directionUp);
 void modifyDeltaMove(int val);
 void modifyInitDelay(int val);
+void selectPrevPage();
+void selectNextPage();
+void modifyAdress(int delta);
+void selectPrevType();
+void selectNextType();
+void selectPrevMode();
+void selectNextMode();
+void pressedButton1();
+void pressedButton2();
+void pressedButton3();
+void pressedButton4();
+void pressedButton5();
+void pressedButton6();
+void pressedButton7();
+void pressedButton8();
 void keyboardTask();
+void asyncMemoryTask();
 void setup();
 void loop();
 
+template <typename T>
+bool rangeCheck(T value, T min, T max)
+{
+  return ((value >= min)&&(value <= max));
+}
+
 void saveToEEprom()
 {
+  unsigned long saveTimeMeas = micros();
   EEPROM.put(dataAddress, servoData);
   EEPROM.put(resetAddress, 0xAA);
+  saveTimeMeas = micros() - saveTimeMeas;             \
   Serial.print(sizeof(servoData));
-  Serial.println(" bytes saved to EEProm!");
+  Serial.print(" bytes -> EEProm! t=");
+  Serial.print(saveTimeMeas);
+  Serial.println("us");
 }
 
 void resetServoData()
@@ -269,89 +310,112 @@ void resetServoData()
   servoData.adress = 24;
   servoData.deltaMove = 20;
 
-  servoData.pos1 = servoPositionStraight;
-  servoData.moving1 = false;
-  servoData.min1 = 1200;
-  servoData.max1 = 1800;
-  servoData.val1 = 1200;
-
-  servoData.pos2 = servoPositionStraight;
-  servoData.moving2 = false;
-  servoData.min2 = 1200;
-  servoData.max2 = 1800;
-  servoData.val2 = 1200;
-
-  servoData.pos3 = servoPositionStraight;
-  servoData.moving3 = false;
-  servoData.min3 = 1200;
-  servoData.max3 = 1800;
-  servoData.val3 = 1200;
-
-  servoData.pos4 = servoPositionStraight;
-  servoData.moving4 = false;
-  servoData.min4 = 1200;
-  servoData.max4 = 1800;
-  servoData.val4 = 1200;
+  for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+  {
+    servoData.servos[servoNumber].pos = servoPositionStraight;
+    servoData.servos[servoNumber].moving = false;
+    servoData.servos[servoNumber].min = 1200;
+    servoData.servos[servoNumber].max = 1800;
+    servoData.servos[servoNumber].val = 1200;
+    servoData.servos[servoNumber].servoMode = servoMode_AlwaysSignalSwitchGnd;
+    servoData.servos[servoNumber].turnoutType = turnoutType_TurnoutRight;
+  }
 
   servoData.initDelay = 1000;
+  servoData.checkByte = 0xAA;
 
   saveToEEprom();
 }
 
-void printServoData(int servo)
+char* describeServoMode(servoModeEnum mode)
 {
-  #define printServoDataPerServo(number)                                  \
-    Serial.print("Servo #");                                              \
-    Serial.print(number);                                                 \
-    Serial.print("; pos = ");                                             \
-    Serial.print(servoData.pos##number ? "true" : "false");               \
-    Serial.print("; min = ");                                             \
-    Serial.print(servoData.min##number);                                  \
-    Serial.print("; max = ");                                             \
-    Serial.print(servoData.max##number);                                  \
-    Serial.print("; val = ");                                             \
-    Serial.println(servoData.val##number);
-    // use macro
-    switch (servo)
-    {
-      case 1: printServoDataPerServo(1); break;
-      case 2: printServoDataPerServo(2); break;
-      case 3: printServoDataPerServo(3); break;
-      case 4: printServoDataPerServo(4); break;
-      default: break;
-    }
-  #undef printServoDataPerServo
+  switch (mode)
+  {
+    case servoMode_AlwaysSignalSwitchGnd: return "AlSSwG"; break;
+    case servoMode_AlwaysSignalAlwaysGnd: return "AlSAlG"; break;
+    case servoMode_SwitchSignalSwitchGnd: return "SwSSwG"; break;
+    case servoMode_SwitchSignalAlwaysGnd: return "SwSAlG"; break;
+  }
+}
+
+void serialPrintServoMode(servoModeEnum mode)
+{
+  Serial.print(describeServoMode(mode));
+}
+  
+void serialPrintTurnoutType(turnoutTypeEnum turnout)
+{
+  switch (turnout)
+  { 
+    case turnoutType_TurnoutRight: Serial.print("TrnR"); break;
+    case turnoutType_TurnoutLeft: Serial.print("TrnL"); break;
+    case turnoutType_DoubleCrossing: Serial.print("DblC"); break;
+    case turnoutType_SingleCrossingRight: Serial.print("CrsR"); break;
+    case turnoutType_SingleCrossingLeft: Serial.print("CrsL"); break;
+  }
+}
+
+void printServoData()
+{
+  for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+  {
+    Serial.print("Servo #");
+    Serial.print(servoNumber);
+    Serial.print("; pos=");
+    Serial.print(servoData.servos[servoNumber].pos ? "true " : "false");
+    Serial.print("; min=");
+    Serial.print(servoData.servos[servoNumber].min);
+    Serial.print("; max=");
+    Serial.print(servoData.servos[servoNumber].max);
+    Serial.print("; val=");
+    Serial.print(servoData.servos[servoNumber].val);
+    Serial.print("; SM=");
+    serialPrintServoMode(servoData.servos[servoNumber].servoMode);
+    Serial.print("; TT=");
+    serialPrintTurnoutType(servoData.servos[servoNumber].turnoutType);
+    Serial.println(";");
+  }
 }
 
 void validateSettings()
 {
-  #define rangeCheckMaxMin(nameOfValue, minValue, maxValue)                      \
-    if (minValue > nameOfValue) nameOfValue = minValue;                          \
-    if (maxValue < nameOfValue) nameOfValue = maxValue;
-  #define rangeCheckMaxMinForSetOfSettings(nameOfValue, minValue, maxValue)      \
-    rangeCheckMaxMin(nameOfValue##1, minValue, maxValue);                        \
-    rangeCheckMaxMin(nameOfValue##2, minValue, maxValue);                        \
-    rangeCheckMaxMin(nameOfValue##3, minValue, maxValue);                        \
-    rangeCheckMaxMin(nameOfValue##4, minValue, maxValue);
-    //use macro(s)
-    rangeCheckMaxMinForSetOfSettings(servoData.min, 1000, 2000);
-    rangeCheckMaxMinForSetOfSettings(servoData.max, 1000, 2000);
-    rangeCheckMaxMinForSetOfSettings(servoData.val, 1000, 2000);
+  if (0xAA == servoData.checkByte)
+  {
+    bool modified = false;
+    #define rangeCheckMaxMin(nameOfValue, minValue, maxValue)                      \
+      if (minValue > nameOfValue) { nameOfValue = minValue; modified = true; }     \
+      if (maxValue < nameOfValue) { nameOfValue = maxValue; modified = true; }
+    for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+    {
+      rangeCheckMaxMin(servoData.servos[servoNumber].min, 1000, 2000);
+      rangeCheckMaxMin(servoData.servos[servoNumber].max, 1000, 2000);
+      rangeCheckMaxMin(servoData.servos[servoNumber].val, 1000, 2000);
+    }
     rangeCheckMaxMin(servoData.adress, 0, 50);
     rangeCheckMaxMin(servoData.deltaMove, 5, 50);
     rangeCheckMaxMin(servoData.initDelay, 1, 10000);
-  #undef rangeCheckMaxMin
-  #undef rangeCheckMaxMinForSetOfSettings
+    #undef rangeCheckMaxMin
+    initDelay = servoData.initDelay;
+    if (modified)
+    {
+      Serial.println("Modified!");
+      error = error_validationFixed;
+    }
+  }
+  else
+  {
+    Serial.print("checkByte=");
+    Serial.println(servoData.checkByte);
+    error = error_validationFailed;
+    for (int servoNumber = 0; servoNumber < 4; servoNumber++) { servoData.servos[servoNumber].moving = false; }
+  }
   // ... and show what we got
-  printServoData(1);
-  printServoData(2);
-  printServoData(3);
-  printServoData(4);
-  Serial.print("1st acc (module) adress = ");
+  printServoData();
+  Serial.print("1st acc (module) adress=");
   Serial.print(servoData.adress);
-  Serial.print("; deltaMove = ");
+  Serial.print("; deltaMove=");
   Serial.print(servoData.deltaMove);
-  Serial.print("us/50ms; deltaMove = ");
+  Serial.print("us/50ms; initDelay=");
   Serial.print(servoData.initDelay);
   Serial.println("ms");
 }
@@ -372,7 +436,8 @@ void readFromEEprom()
   else
   {
     resetServoData();
-    Serial.println("No valid data stored in EEProm. Reset decoder data!");
+    error = error_readEepromFailed;
+    Serial.println("EEProm invalid. Reset!");
   }
   //range check read values
   validateSettings();
@@ -388,18 +453,18 @@ void selftestTask()
         servoTaskActive = false;
         digitalWrite(LED_BUILTIN, HIGH);
         break;
-      case 1: digitalWrite(LED_BUILTIN, LOW); break;
-      case 2: digitalWrite(LED_BUILTIN, HIGH); break;
-      case 3: digitalWrite(LED_BUILTIN, LOW); break;
+      case 1:  digitalWrite(LED_BUILTIN, LOW);  break;
+      case 2:  digitalWrite(LED_BUILTIN, HIGH); break;
+      case 3:  digitalWrite(LED_BUILTIN, LOW);  break;
       //switch relays
-      case 4: digitalWrite(relay1Pin, HIGH); break;
-      case 5: digitalWrite(relay2Pin, HIGH); break;
-      case 6: digitalWrite(relay3Pin, HIGH); break;
-      case 7: digitalWrite(relay4Pin, HIGH); break;
-      case 8: digitalWrite(relay1Pin, LOW); break;
-      case 9: digitalWrite(relay2Pin, LOW); break;
-      case 10: digitalWrite(relay3Pin, LOW); break;
-      case 11: digitalWrite(relay4Pin, LOW); break;
+      case 4:  digitalWrite(relayPin[0], HIGH); break;
+      case 5:  digitalWrite(relayPin[1], HIGH); break;
+      case 6:  digitalWrite(relayPin[2], HIGH); break;
+      case 7:  digitalWrite(relayPin[3], HIGH); break;
+      case 8:  digitalWrite(relayPin[0], LOW);  break;
+      case 9:  digitalWrite(relayPin[1], LOW);  break;
+      case 10: digitalWrite(relayPin[2], LOW);  break;
+      case 11: digitalWrite(relayPin[3], LOW);  break;
       //all to the left
       case 12:
         servoTaskActive = true;
@@ -418,7 +483,7 @@ void selftestTask()
         selftestRunning = false;
         readFromEEprom();
         fixServoPosition();
-        Serial.println("... finished!");
+        Serial.println("... done!");
         break;
       default:
         break;
@@ -476,32 +541,27 @@ void ledTask()
 void fixServoPosition()
 {
   // fix position
-  if (IS_WHERE(Straight, 1)) servoData.val1 = servoData.min1; else servoData.val1 = servoData.max1;
-  if (IS_WHERE(Straight, 2)) servoData.val2 = servoData.min2; else servoData.val2 = servoData.max2;
-  if (IS_WHERE(Straight, 3)) servoData.val3 = servoData.min3; else servoData.val3 = servoData.max3;
-  if (IS_WHERE(Straight, 4)) servoData.val4 = servoData.min4; else servoData.val4 = servoData.max4;
+  for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+  {
+    if (servoPositionStraight == servoData.servos[servoNumber].pos)
+    {
+      servoData.servos[servoNumber].val = servoData.servos[servoNumber].min;
+    } else {
+      servoData.servos[servoNumber].val = servoData.servos[servoNumber].max;
+    }
+  }
 }
 
 void initialiseOutputsAndPins()
 {
   // care about output defaults
-  pinMode(servGnd1Pin, OUTPUT);
-  pinMode(servGnd2Pin, OUTPUT);
-  pinMode(servGnd3Pin, OUTPUT);
-  pinMode(servGnd4Pin, OUTPUT);
-  pinMode(relay1Pin, OUTPUT);
-  pinMode(relay2Pin, OUTPUT);
-  pinMode(relay3Pin, OUTPUT);
-  pinMode(relay4Pin, OUTPUT);
-  digitalWrite(servGnd1Pin, LOW);
-  digitalWrite(servGnd2Pin, LOW);
-  digitalWrite(servGnd3Pin, LOW);
-  digitalWrite(servGnd4Pin, LOW);
-  digitalWrite(relay1Pin, LOW);
-  digitalWrite(relay2Pin, LOW);
-  digitalWrite(relay3Pin, LOW);
-  digitalWrite(relay4Pin, LOW);
-
+  for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+  {
+    pinMode(servGndPin[servoNumber], OUTPUT);
+    pinMode(relayPin[servoNumber], OUTPUT);
+    digitalWrite(servGndPin[servoNumber], LOW);
+    digitalWrite(relayPin[servoNumber], LOW);
+  }
   dcc.attach(dccPin);
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(progBtnPin, INPUT_PULLUP);
@@ -509,33 +569,32 @@ void initialiseOutputsAndPins()
 
 void initialiseServos()
 {
-  //prepare servos
-  servo1.attach(servo1Pin);
-  servo2.attach(servo2Pin);
-  servo3.attach(servo3Pin);
-  servo4.attach(servo4Pin);
-  //write given values
-  servo1.writeMicroseconds(servoData.val1);
-  servo2.writeMicroseconds(servoData.val2);
-  servo3.writeMicroseconds(servoData.val3);
-  servo4.writeMicroseconds(servoData.val4);
+  for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+  { //prepare servos
+    servo[servoNumber].attach(servoPin[servoNumber]);
+    //write given values
+    servo[servoNumber].writeMicroseconds(servoData.servos[servoNumber].val);
+  }
 }
 
 void printHelp()
 {
   Serial.println("available commands (followed by enter):");
   Serial.println("set;<type>;<servo_nr>;<value> ... set some servo values");
-  Serial.println("  type=min: minimum servo position");
-  Serial.println("  type=max: maximum servo position");
-  Serial.println("  type=val: actual servo position");
-  Serial.println("set;<type>;<value> .............. set other values");
+  Serial.println("  type=min: min pos [1000..2000]");
+  Serial.println("  type=max: max pos [1000..2000]");
+  Serial.println("  type=val: actual pos [1000..2000]");
+  Serial.println("  type=smo: servo mode [0..3]");
+  Serial.println("  type=tty: turnout mode [0..4]");
+  Serial.println("set;<type>;<value> set other values");
   Serial.println("  type=adr: first adress of servo");
   Serial.println("  type=dlt: microsecs per step (50ms)");
   Serial.println("  type=dly: initial delay [ms]");
-  Serial.println("slv ............................. start selftest");
-  Serial.println("rst ............................. reset servo data");
-  Serial.println("dbg ............................. debug mode");
-  Serial.println("dbr ............................. reset statistic");
+  Serial.println("slv: start selftest");
+  Serial.println("rst: reset servo data");
+  Serial.println("dbg: debug mode");
+  Serial.println("dbr: reset statistic");
+  Serial.println("sta: show statistic");
 }
 
 void getSerialTokens()
@@ -578,86 +637,54 @@ void getSerialTokens()
 void setSelectedServoPos(int selServo, servoPosition newValue, bool saveState)
 {
   int counterValue = 5;
-  switch (selServo)
-  {
-    case 1:
-      servoData.pos1 = newValue;
-      posCounter1 = counterValue;
-      servoData.moving1 = true;
-      break;
-    case 2:
-      servoData.pos2 = newValue;
-      posCounter2 = counterValue;
-      servoData.moving2 = true;
-      break;
-    case 3:
-      servoData.pos3 = newValue;
-      posCounter3 = counterValue;
-      servoData.moving3 = true;
-      break;
-    case 4:
-      servoData.pos4 = newValue;
-      posCounter4 = counterValue;
-      servoData.moving4 = true;
-      break;
-    default:
-      break;
-  }
+  if (!rangeCheck<int>(selServo, 1, 4)) return;
+  servoData.servos[selServo-1].pos = newValue;
+  posCounter[selServo-1] = counterValue;
+  servoData.servos[selServo-1].moving = true;
   Serial.print("Set Servo #");
   Serial.print(selServo);
-  Serial.print(" to new pos = ");
-  Serial.println(servoPositionMiddle == newValue ? "middle" : (servoPositionStraight == newValue ? "straight" : "round"));
+  Serial.print(" pos=");
+  Serial.println(servoPositionMiddle == newValue ? "mid" : (servoPositionStraight == newValue ? "straight" : "round"));
   if (saveState)
   {
-    saveToEEprom();
+    saveToEepromWheneverThereIsTime = true;
   }
+}
+
+void setSelectedServoSmo(int selServo, int newValue)
+{
+  servoData.servos[selServo-1].servoMode = static_cast<servoModeEnum>(newValue);
+}
+
+void setSelectedServoTty(int selServo, int newValue)
+{
+  servoData.servos[selServo-1].turnoutType = static_cast<turnoutTypeEnum>(newValue);
 }
 
 void setSelectedServoMax(int selServo, int newValue)
 {
-  switch (selServo)
-  {
-    case 1: servoData.max1 = newValue; break;
-    case 2: servoData.max2 = newValue; break;
-    case 3: servoData.max3 = newValue; break;
-    case 4: servoData.max4 = newValue; break;
-    default: break;
-  }
+  servoData.servos[selServo-1].max = newValue;
   Serial.print("Set Servo #");
   Serial.print(selServo);
-  Serial.print(" to new max = ");
+  Serial.print(" max=");
   Serial.println(newValue);
 }
 
 void setSelectedServoMin(int selServo, int newValue)
 {
-  switch (selServo)
-  {
-    case 1: servoData.min1 = newValue; break;
-    case 2: servoData.min2 = newValue; break;
-    case 3: servoData.min3 = newValue; break;
-    case 4: servoData.min4 = newValue; break;
-    default: break;
-  }
+  servoData.servos[selServo-1].min = newValue;
   Serial.print("Set Servo #");
   Serial.print(selServo);
-  Serial.print(" to new min = ");
+  Serial.print(" min=");
   Serial.println(newValue);
 }
 
 void setSelectedServoVal(int selServo, int newValue)
 {
-  switch (selServo)
-  {
-    case 1: servoData.val1 = newValue; break;
-    case 2: servoData.val2 = newValue; break;
-    case 3: servoData.val3 = newValue; break;
-    case 4: servoData.val4 = newValue; break;
-    default: break;
-  }
+  servoData.servos[selServo-1].val = newValue;
   Serial.print("Set Servo #");
   Serial.print(selServo);
-  Serial.print(" to new val = ");
+  Serial.print(" val=");
   Serial.println(newValue);
 }
 
@@ -708,6 +735,20 @@ void analyseSerialCommand(void)
         setSelectedServoVal(value1, serialTokens[2]->toInt());
       }
     }
+    else if (serialTokens[0]->equals("smo"))
+    {
+      if ((0 <= value1) && (3 >= value1))
+      {
+        setSelectedServoSmo(value1, serialTokens[2]->toInt());
+      }
+    }
+    else if (serialTokens[0]->equals("tty"))
+    {
+      if ((1 <= value1) && (5 >= value1))
+      {
+        setSelectedServoTty(value1, serialTokens[2]->toInt());
+      }
+    }
     else if (serialTokens[0]->equals("pos"))
     {
       if ((1 <= value1) && (5 >= value1))
@@ -729,7 +770,7 @@ void analyseSerialCommand(void)
     }
     else
     {
-      Serial.print("Unknown Command: ");
+      Serial.print("Unk. Command: ");
       Serial.println(serialBuffer);
     }
     validateSettings();
@@ -761,6 +802,11 @@ void analyseSerialCommand(void)
     displayTaskStats.clear();
     progButtonTaskStats.clear();
     keyboardTaskStats.clear();
+    asyncMemoryTaskStats.clear();
+  }
+  else if (serialBuffer.startsWith("sta"))
+  {
+    showStatisticsOnSerial();
   }
   else if (serialBuffer.startsWith("rst"))
   {
@@ -774,7 +820,7 @@ void analyseSerialCommand(void)
     }
     else
     {
-      Serial.println("Unknown Command!");
+      Serial.println("Unk. Command!");
     }
   }
 }
@@ -798,6 +844,53 @@ void helloDisplay()
   u8g2.drawStr(30, 44, "initial delay");
   u8g2.drawStr(30, 56, "waiting...");
   u8g2.sendBuffer();
+}
+
+#ifdef __arm__
+// should use uinstd.h to define sbrk but Due causes a conflict
+extern "C" char* sbrk(int incr);
+#else  // __ARM__
+extern char *__brkval;
+#endif  // __arm__
+int freeMemory()
+{
+  char top;
+  #ifdef __arm__
+    return &top - reinterpret_cast<char*>(sbrk(0));
+  #elif defined(CORE_TEENSY) || (ARDUINO > 103 && ARDUINO != 151)
+    return &top - __brkval;
+  #else  // __arm__
+    return __brkval ? &top - __brkval : &top - __malloc_heap_start;
+  #endif  // __arm__
+}
+
+void printAStat(const char * name, const typeStats stat)
+{
+  Serial.print( name );
+  Serial.print(": AVG=");
+  Serial.print(stat.average());
+  Serial.print("; MIN=");
+  Serial.print(stat.minimum());
+  Serial.print("; MAX=");
+  Serial.println(stat.maximum());
+}
+
+void showStatisticsOnSerial()
+{
+  //use macro
+  printAStat("loopOvr", loopOverallStats);
+  printAStat("dccIntT", dccInterfaceTaskStats);
+  printAStat("servoT_", servoTaskStats);
+  printAStat("ledTask", ledTaskStats);
+  printAStat("serialT", serialInterfaceTaskStats);
+  printAStat("selftes", selftestTaskStats);
+  printAStat("display", displayTaskStats);
+  printAStat("progBut", progButtonTaskStats);
+  printAStat("keybTas", keyboardTaskStats);
+  printAStat("asyncMe", asyncMemoryTaskStats);
+  Serial.print("free mem: ");
+  Serial.print(freeMemory());
+  Serial.println("bytes");
 }
 
 void I2CWrite(int adress, byte data)
@@ -827,7 +920,7 @@ void scanI2CBus()
 {
   byte error, address;
   int nDevices;
-  Serial.println("Scanning I2C...");
+  Serial.println("Scan I2C...");
   nDevices = 0;
   for (address = 1; address < 127; address++ )
   {
@@ -838,7 +931,7 @@ void scanI2CBus()
     error = Wire.endTransmission();
     if (error == 0)
     {
-      Serial.print("I2C device found at address 0x");
+      Serial.print("I2C dev. at 0x");
       if (address < 16)
         Serial.print("0");
       Serial.println(address, HEX);
@@ -846,14 +939,14 @@ void scanI2CBus()
     }
     else if (error == 4)
     {
-      Serial.print("Unknown error at address 0x");
+      Serial.print("Unk. err at 0x");
       if (address < 16)
         Serial.print("0");
       Serial.println(address, HEX);
     }
   }
   if (nDevices == 0)
-    Serial.println("No I2C devices found\n");
+    Serial.println("No I2C dev found\n");
   else
     Serial.println("done.\n");
 
@@ -892,50 +985,49 @@ void dccInterfaceTask()
   }
 }
 
+void careServo(int number, int target, servoPosition position)
+{
+  if (servoData.servos[number].pos == position)
+  {
+    if (abs(servoData.servos[number].val - target) < servoData.deltaMove)
+    {
+      servoData.servos[number].moving = false;
+      servoData.servos[number].val = target;
+    }
+    else if (servoData.servos[number].val < target)
+    {
+      if (0 < posCounter[number]) { posCounter[number]--; } else { servoData.servos[number].val += servoData.deltaMove; }
+      servoData.servos[number].moving = true;
+    }
+    else
+    {
+      if (0 < posCounter[number]) { posCounter[number]--; } else { servoData.servos[number].val -= servoData.deltaMove; }
+      servoData.servos[number].moving = true;
+    }
+    bool alwaysSignal = (servoData.servos[number].servoMode == servoMode_AlwaysSignalAlwaysGnd) || (servoData.servos[number].servoMode == servoMode_AlwaysSignalSwitchGnd);
+    if ((MIN_PULSE_WIDTH <= servoData.servos[number].val) && (MAX_PULSE_WIDTH > servoData.servos[number].val))
+    {
+      int value = servoData.servos[number].val;
+      if (servoData.servos[number].moving) { if (!servo[number].attached()) { servo[number].attach(servoPin[number]); }} else { if (!alwaysSignal) servo[number].detach(); };
+      if (servo[number].attached()) servo[number].writeMicroseconds(value);
+    }
+    frogRelayOn[number] = (servoData.servos[number].val > ((servoData.servos[number].max + servoData.servos[number].min)/2));
+    bool alwaysGnd = (servoData.servos[number].servoMode == servoMode_AlwaysSignalAlwaysGnd) || (servoData.servos[number].servoMode == servoMode_SwitchSignalAlwaysGnd);
+    digitalWrite(relayPin[number], frogRelayOn[number] ? HIGH : LOW);
+    digitalWrite(servGndPin[number], servoData.servos[number].moving || (number+1 == selectedServo) || alwaysGnd ? HIGH : LOW);
+  }
+}
+
 void servoTask()
 {
   if (((millis() - lastServoTime ) > 50) && servoTaskActive)
   {
-    // define macro
-    #define careServo(number, target, position)                                                                         \
-      if (servoData.pos##number == position)                                                                            \
-      {                                                                                                                 \
-        if (abs(servoData.val##number - target) < servoData.deltaMove)                                                  \
-        {                                                                                                               \
-          servoData.moving##number = false;                                                                             \
-          servoData.val##number = target;                                                                               \
-        }                                                                                                               \
-        else if (servoData.val##number < target)                                                                        \
-        {                                                                                                               \
-          if (0 < posCounter##number) { posCounter##number--; } else { servoData.val##number += servoData.deltaMove; }  \
-          servoData.moving##number = true;                                                                              \
-        }                                                                                                               \
-        else                                                                                                            \
-        {                                                                                                               \
-          if (0 < posCounter##number) { posCounter##number--; } else { servoData.val##number -= servoData.deltaMove; }  \
-          servoData.moving##number = true;                                                                              \
-        }                                                                                                               \
-        if ((MIN_PULSE_WIDTH <= servoData.val##number) && (MAX_PULSE_WIDTH > servoData.val##number))                    \
-        {                                                                                                               \
-          servo##number.writeMicroseconds(servoData.val##number);                                                       \
-        }                                                                                                               \
-        frogRelay##number##On = (servoData.val##number > ((servoData.max##number + servoData.min##number)/2));          \
-        digitalWrite(relay##number##Pin, frogRelay##number##On ? LOW : HIGH);                                           \
-        digitalWrite(servGnd##number##Pin, servoData.moving##number || (number == selectedServo) ? HIGH : LOW);         \
+      for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+      { //call for all three positions for every servo
+        careServo(servoNumber, servoData.servos[servoNumber].min, servoPositionStraight);
+        careServo(servoNumber, servoData.servos[servoNumber].max, servoPositionRound);
+        careServo(servoNumber, ((servoData.servos[servoNumber].max + servoData.servos[servoNumber].min)/2), servoPositionMiddle);
       }
-      // use macro, one for each direction
-      careServo(1, servoData.min1, servoPositionStraight);
-      careServo(1, servoData.max1, servoPositionRound);
-      careServo(1, ((servoData.max1+servoData.min1)/2), servoPositionMiddle);
-      careServo(2, servoData.min2, servoPositionStraight);
-      careServo(2, servoData.max2, servoPositionRound);
-      careServo(2, ((servoData.max2+servoData.min2)/2), servoPositionMiddle);
-      careServo(3, servoData.min3, servoPositionStraight);
-      careServo(3, servoData.max3, servoPositionRound);
-      careServo(3, ((servoData.max3+servoData.min3)/2), servoPositionMiddle);
-      careServo(4, servoData.min4, servoPositionStraight);
-      careServo(4, servoData.max4, servoPositionRound);
-      careServo(4, ((servoData.max4+servoData.min4)/2), servoPositionMiddle);
       // get rid of macro
     #undef careServo
     lastServoTime = millis();
@@ -944,12 +1036,18 @@ void servoTask()
 
 void displayTask()
 {
-  if (servoData.moving1 || servoData.moving2 || servoData.moving3 || servoData.moving4)
+  if ((millis() - lastDisplayTime) > 300)
   {
-    return;
-  }
-  else if ((millis() - lastDisplayTime) > 300)
-  {
+    if (error != error_none)
+    { // in case of error just show that
+      displayError();
+      return;
+    }
+    if (servoData.servos[0].moving || servoData.servos[1].moving || servoData.servos[2].moving || servoData.servos[3].moving)
+    { // no show when moving
+      return;
+    }
+    // divide into slots to keep load low
     switch (displayStatus)
     {
       case displayStatus_clear:
@@ -966,6 +1064,64 @@ void displayTask()
         break;
     }
     lastDisplayTime = millis();
+  }
+}
+
+void displayError()
+{
+  u8g2.clearBuffer();
+  u8g2.drawStr(0,  8, "ERROR:");
+  switch (error)
+  {
+    default:
+    case error_none:
+      break;
+    case error_readEepromFailed: u8g2.drawStr(0,  30, "Read EEProm failed!"); break;
+    case error_validationFailed: u8g2.drawStr(0,  30, "Validation failed!"); break;
+    case error_validationFixed: u8g2.drawStr(0,  30, "Validation fixed!"); break;
+  }
+  u8g2.sendBuffer();
+}
+
+void showTurnoutPosition(int number, u8g2_uint_t xPos, u8g2_uint_t yPos, turnoutTypeEnum type)
+{
+  bool isRound = IS_WHERE(Round, number-1);
+  bool isStraight = IS_WHERE(Straight, number-1);
+  bool isMiddle = IS_WHERE(Middle, number-1);
+  switch(type)
+  {
+    case turnoutType_TurnoutLeft: 
+      u8g2.drawStr(isRound ? xPos + 4 : xPos , yPos, isStraight ? "||" : "//");
+      u8g2.drawStr(xPos,  yPos+8, isMiddle ? "><" : isStraight ? "||" : "//");
+      break;
+    case turnoutType_TurnoutRight: 
+      u8g2.drawStr(xPos,  yPos, isMiddle ? "><" : isStraight ? "||" : "\\\\");
+      u8g2.drawStr(isRound ? xPos + 4 : xPos , yPos+8, isStraight ? "||" : "\\\\");
+      break;
+    case turnoutType_DoubleCrossing: 
+      u8g2.drawStr(xPos,  yPos, isStraight ? "\\\\//" : "//\\\\");
+      u8g2.drawStr(xPos,  yPos+8, isStraight ? "//\\\\" : "\\\\//");
+      break;
+    case turnoutType_SingleCrossingLeft: 
+      u8g2.drawStr(xPos,  yPos, isStraight ? "\\\\||" : "//||");
+      u8g2.drawStr(xPos,  yPos+8, isStraight ? "//||" : "\\\\||");
+      break;
+    case turnoutType_SingleCrossingRight: 
+      u8g2.drawStr(xPos,  yPos, isStraight ? "||\\\\" : "||//");
+      u8g2.drawStr(xPos,  yPos+8, isStraight ? "||//" : "||\\\\");
+      break;
+  }
+}
+
+void showServoMode(const u8g2_uint_t xPos, const u8g2_uint_t yPos, const servoModeEnum mode)
+{
+  u8g2.drawStr(xPos,  yPos, "Signal GND");
+  switch (mode)
+  {
+    case servoMode_AlwaysSignalSwitchGnd: u8g2.drawStr(xPos, yPos, "Alws   Sw"  ); break;
+    case servoMode_AlwaysSignalAlwaysGnd: u8g2.drawStr(xPos, yPos, "Alws   Alws"); break;
+    case servoMode_SwitchSignalSwitchGnd: u8g2.drawStr(xPos, yPos, "Turn   Sw"  ); break;
+    case servoMode_SwitchSignalAlwaysGnd: u8g2.drawStr(xPos, yPos, "Turn   Alws"); break;
   }
 }
 
@@ -1022,80 +1178,77 @@ void displayFillContent()
     char iterationStr[20]; snprintf(iterationStr, 20, "%d", selftestIteration); u8g2.drawStr(0,  45, iterationStr);
   }
   else
-  { // show the standard screen
-    // header
-    if ((0==selectedServo)||((aLiveClockCounter%2)||!(1==selectedServo))) u8g2.drawStr(0,  8, "S1__");
-    if ((0==selectedServo)||((aLiveClockCounter%2)||!(2==selectedServo))) u8g2.drawStr(32, 8, "S2__");
-    if ((0==selectedServo)||((aLiveClockCounter%2)||!(3==selectedServo))) u8g2.drawStr(64, 8, "S3__");
-    if ((0==selectedServo)||((aLiveClockCounter%2)||!(4==selectedServo))) u8g2.drawStr(96, 8, "S4__");
-    if (0 == selectedServo)
-    {
-      // show position
-      char s1PosStr[20]; snprintf(s1PosStr, 20, "%d", servoData.val1); u8g2.drawStr(0,  20, s1PosStr);
-      char s2PosStr[20]; snprintf(s2PosStr, 20, "%d", servoData.val2); u8g2.drawStr(32, 20, s2PosStr);
-      char s3PosStr[20]; snprintf(s3PosStr, 20, "%d", servoData.val3); u8g2.drawStr(64, 20, s3PosStr);
-      char s4PosStr[20]; snprintf(s4PosStr, 20, "%d", servoData.val4); u8g2.drawStr(96, 20, s4PosStr);
-      // show position
-      u8g2.drawStr(IS_WHERE(Round, 1) ? 4   : 0 , 33, IS_WHERE(Straight, 1) ? "||" : "//");
-      u8g2.drawStr(IS_WHERE(Round, 2) ? 36  : 32, 33, IS_WHERE(Straight, 2) ? "||" : "//");
-      u8g2.drawStr(IS_WHERE(Round, 3) ? 68  : 64, 33, IS_WHERE(Straight, 3) ? "||" : "//");
-      u8g2.drawStr(IS_WHERE(Round, 4) ? 100 : 96, 33, IS_WHERE(Straight, 4) ? "||" : "//");
-      u8g2.drawStr(0,  41, IS_WHERE(Middle, 1) ? "><" : (IS_WHERE(Straight, 1) ? "||" : "//"));
-      u8g2.drawStr(32, 41, IS_WHERE(Middle, 2) ? "><" : (IS_WHERE(Straight, 2) ? "||" : "//"));
-      u8g2.drawStr(64, 41, IS_WHERE(Middle, 3) ? "><" : (IS_WHERE(Straight, 3) ? "||" : "//"));
-      u8g2.drawStr(96, 41, IS_WHERE(Middle, 4) ? "><" : (IS_WHERE(Straight, 4) ? "||" : "//"));
-      // show relay
-      u8g2.drawStr(0  + 20, 42, frogRelay1On ? "+" : "-");
-      u8g2.drawStr(32 + 20, 42, frogRelay2On ? "+" : "-");
-      u8g2.drawStr(64 + 20, 42, frogRelay3On ? "+" : "-");
-      u8g2.drawStr(96 + 20, 42, frogRelay4On ? "+" : "-");
-    }
-    else
-    {
-      // show min
-      char s1MaxStr[20]; snprintf(s1MaxStr, 20, "%d", servoData.min1); u8g2.drawStr(0,  20, s1MaxStr);
-      char s2MaxStr[20]; snprintf(s2MaxStr, 20, "%d", servoData.min2); u8g2.drawStr(32, 20, s2MaxStr);
-      char s3MaxStr[20]; snprintf(s3MaxStr, 20, "%d", servoData.min3); u8g2.drawStr(64, 20, s3MaxStr);
-      char s4MaxStr[20]; snprintf(s4MaxStr, 20, "%d", servoData.min4); u8g2.drawStr(96, 20, s4MaxStr);
-      // show target
-      u8g2.drawStr(0,  31, IS_WHERE(Middle, 1) ? "--M--" : (IS_WHERE(Round, 1) ? " \\/\\/" : " /\\/\\"));
-      u8g2.drawStr(32, 31, IS_WHERE(Middle, 2) ? "--M--" : (IS_WHERE(Round, 2) ? " \\/\\/" : " /\\/\\"));
-      u8g2.drawStr(64, 31, IS_WHERE(Middle, 3) ? "--M--" : (IS_WHERE(Round, 3) ? " \\/\\/" : " /\\/\\"));
-      u8g2.drawStr(96, 31, IS_WHERE(Middle, 4) ? "--M--" : (IS_WHERE(Round, 4) ? " \\/\\/" : " /\\/\\"));
-      // show max
-      char s1MinStr[20]; snprintf(s1MinStr, 20, "%d", servoData.max1); u8g2.drawStr(0,  42, s1MinStr);
-      char s2MinStr[20]; snprintf(s2MinStr, 20, "%d", servoData.max2); u8g2.drawStr(32, 42, s2MinStr);
-      char s3MinStr[20]; snprintf(s3MinStr, 20, "%d", servoData.max3); u8g2.drawStr(64, 42, s3MinStr);
-      char s4MinStr[20]; snprintf(s4MinStr, 20, "%d", servoData.max4); u8g2.drawStr(96, 42, s4MinStr);
-    }
-    // adress, speed, initial delay
-    char adressStr[20]; snprintf(adressStr, 20, "a=%d", servoData.adress); u8g2.drawStr(0,  53, adressStr);
-    char deltaStr[20]; snprintf(deltaStr, 20, "dt=%d", servoData.deltaMove); u8g2.drawStr(32,  53, deltaStr);
-    char initDelayStr[20]; snprintf(initDelayStr, 20, "id=%d", servoData.initDelay); u8g2.drawStr(64,  53, initDelayStr);
-    char selectedStr[2] = "-";
-    if (0 == selectedServo)
-    {
-      sprintf(selectedStr, "*");
-    }
-    else
-    {
-      sprintf(selectedStr, "%d", selectedServo);
-    }
-    u8g2.drawStr(120, 50, selectedStr);
-  }
-  // version
-  u8g2.drawStr(0, 64, "DCC");
-  u8g2.drawStr(32, 64, VERSION);
-  // turn around the clock
-  switch (aLiveClockCounter % 4)
   {
-    case 0: u8g2.drawStr(64, 64, "|"); break;
-    case 1: u8g2.drawStr(64, 64, "/"); break;
-    case 2: u8g2.drawStr(64, 64, "-"); break;
-    case 3: u8g2.drawStr(64, 64, "\\"); break;
+    if (0 == selectedServo)
+    { // show the standard screen
+      for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+      {
+        u8g2_uint_t pos = servoNumber * 32;
+        char servoPosStr[5]; snprintf(servoPosStr, 5, "S%d__", servoNumber); u8g2.drawStr(pos,  8, servoPosStr);
+        char s1PosStr[20]; snprintf(s1PosStr, 20, "%d", servoData.servos[servoNumber].val); u8g2.drawStr(pos,  20, s1PosStr);
+        showTurnoutPosition(servoNumber+1, pos, 33, servoData.servos[servoNumber].turnoutType);
+      }
+      char adressStr[20]; snprintf(adressStr, 20, "a=%d", servoData.adress); u8g2.drawStr(0,  53, adressStr);
+      char deltaStr[20]; snprintf(deltaStr, 20, "dt=%d", servoData.deltaMove); u8g2.drawStr(32,  53, deltaStr);
+      char initDelayStr[20]; snprintf(initDelayStr, 20, "id=%d", servoData.initDelay); u8g2.drawStr(64,  53, initDelayStr);
+      // version
+      u8g2.drawStr(0, 64, "DCC");
+      u8g2.drawStr(32, 64, VERSION);
+      // turn around the clock
+      switch (aLiveClockCounter % 4)
+      {
+        case 0: u8g2.drawStr(64, 64, "|"); break;
+        case 1: u8g2.drawStr(64, 64, "/"); break;
+        case 2: u8g2.drawStr(64, 64, "-"); break;
+        case 3: u8g2.drawStr(64, 64, "\\"); break;
+      }
+      // me
+      u8g2.drawStr(80, 64, "(c)EMM");
+    }
+    else
+    { // show programming screens
+      auto showServo = (0 == aLiveClockCounter%2);
+      if (showServo)
+      {
+        char servoPosStr[5]; snprintf(servoPosStr, 5, "S%d Selected", selectedServo); u8g2.drawStr(0,  8, servoPosStr);
+      }
+      if (progPageServoLimits == selectedPage)
+      { // Servo limits
+        for (int servoNumber = 0; servoNumber < 4; servoNumber++)
+        {
+          u8g2_uint_t pos = servoNumber * 32;
+          char s1MaxStr[20]; snprintf(s1MaxStr, 20, "%d", servoData.servos[servoNumber].min); u8g2.drawStr(pos,  28, s1MaxStr);
+          u8g2.drawStr(pos,  39, IS_WHERE(Middle, servoNumber) ? "--M--" : (IS_WHERE(Round, servoNumber) ? " \\/\\/" : " /\\/\\"));
+          char s1MinStr[20]; snprintf(s1MinStr, 20, "%d", servoData.servos[servoNumber].max); u8g2.drawStr(pos,  50, s1MinStr);
+        }
+        if (!showServo) u8g2.drawStr(0,  8, "POSITION");
+        u8g2.drawStr(0,  62, "Left");
+        u8g2.drawStr(32, 62, "Rght");
+      }
+      if (progPageAdrDelta == selectedPage)
+      { // Adress and delta
+        if (!showServo) u8g2.drawStr(0,  8, "DCC | DELTA");
+        u8g2.drawStr(0,  62, "Adr");
+        u8g2.drawStr(32, 62, "Dlt");
+        char adressStr[20]; snprintf(adressStr, 20, "a=%d",  servoData.adress);    u8g2.drawStr(0,  41, adressStr);
+        char deltaStr[20];  snprintf(deltaStr,  20, "dt=%d", servoData.deltaMove); u8g2.drawStr(32, 41, deltaStr);
+      }
+      if (progPageTypeMode == selectedPage)
+      { // Type und Mode
+        if (!showServo) u8g2.drawStr(0,  8, "TYPE | MODE");
+        u8g2.drawStr(0,  62, "Type");      
+        u8g2.drawStr(32, 62, "Mode");
+        if (0 < selectedServo)
+        {
+        showTurnoutPosition(selectedServo, 0, 41, servoData.servos[selectedServo-1].turnoutType);
+        showServoMode(32, 41, servoData.servos[selectedServo-1].servoMode);
+        }
+      }
+      u8g2.drawStr(93, 8, "Cancel");
+      u8g2.drawStr(64, 62, "Page");
+      u8g2.drawStr(96, 62, "Save");
+    }
   }
-  // me
-  u8g2.drawStr(80, 64, "(c)EMM");
   aLiveClockCounter++;
 }
 
@@ -1109,13 +1262,7 @@ void careSelectedServo()
   // restore last selectet Servo position
   if (0 < selectedServo) 
   {
-    switch (selectedServo)
-    {
-      case 1: servoData.pos1 = lastSelectedServoPos1; break;
-      case 2: servoData.pos2 = lastSelectedServoPos2; break;
-      case 3: servoData.pos3 = lastSelectedServoPos3; break;
-      case 4: servoData.pos4 = lastSelectedServoPos4; break;
-    }
+    servoData.servos[selectedServo-1].pos = lastSelectedServoPos[selectedServo-1];
   }
   // select next Servo
   selectedServo++;
@@ -1124,18 +1271,12 @@ void careSelectedServo()
   {
     selectedServo = 0;
     decoderState = stateIdle;
-    saveToEEprom();
+    saveToEepromWheneverThereIsTime = true;
   }
   // remember old servo position and set selected to middle position
   if (0 < selectedServo) 
   {
-    switch (selectedServo)
-    {
-      case 1: lastSelectedServoPos1 = servoData.pos1; break;
-      case 2: lastSelectedServoPos2 = servoData.pos2; break;
-      case 3: lastSelectedServoPos3 = servoData.pos3; break;
-      case 4: lastSelectedServoPos4 = servoData.pos4; break;
-    }
+    lastSelectedServoPos[selectedServo-1] = servoData.servos[selectedServo-1].pos;
     setSelectedServoPos(selectedServo, servoPositionMiddle, false);
   }
 }
@@ -1170,7 +1311,7 @@ void progButtonTask()
     if (progBtnPinActive && (progBtnPinActive != progBtnPinActiveOld))
     {
       careSelectedServo();
-      Serial.print("Prog. Button edge detected. SelectedServo = ");
+      Serial.print("Prog -> SelServ=");
       Serial.println(selectedServo);
     }
     progBtnPinActiveOld = progBtnPinActive;
@@ -1187,25 +1328,11 @@ void modifySelServo(servoPosition pos, bool directionUp)
   {
     if (servoPositionRound == pos)
     {
-      switch (selectedServo)
-      {
-        case 1: servoData.max1 += delta; break;
-        case 2: servoData.max2 += delta; break;
-        case 3: servoData.max3 += delta; break;
-        case 4: servoData.max4 += delta; break;
-        default: break;
-      }
+      servoData.servos[selectedServo-1].max += delta;
     }
     if (servoPositionStraight == pos)
     {
-      switch (selectedServo)
-      {
-        case 1: servoData.min1 += delta; break;
-        case 2: servoData.min2 += delta; break;
-        case 3: servoData.min3 += delta; break;
-        case 4: servoData.min4 += delta; break;
-        default: break;
-      }
+      servoData.servos[selectedServo-1].min += delta;
     }
   }
   setSelectedServoPos(selectedServo, pos, false);
@@ -1220,6 +1347,216 @@ void modifyDeltaMove(int val)
 void modifyInitDelay(int val)
 {
   servoData.initDelay += val;
+}
+
+void selectPrevPage()
+{
+  if (progPageServoLimits == selectedPage)
+  { // rotate
+    selectedPage = progPageTypeMode;
+  }
+  else
+  { // fair enough
+    selectedPage = (progPage)((int)selectedPage - 1);
+  }
+}
+
+void selectNextPage()
+{
+  if (progPageTypeMode == selectedPage)
+  { // rotate
+    selectedPage = progPageServoLimits;
+  }
+  else
+  { // fair enough
+    selectedPage = (progPage)((int)selectedPage + 1);
+  }
+}
+
+void modifyAdress(int delta)
+{
+  servoData.adress += delta;
+  if (servoData.adress < 0) servoData.adress = 0;
+  if (servoData.adress > 80) servoData.adress = 80;
+}
+
+void selectPrevType()
+{
+  if (0 != selectedServo)
+  { 
+    auto type = servoData.servos[selectedServo-1].turnoutType;
+    if (0 < type)
+    {
+      servoData.servos[selectedServo-1].turnoutType = (turnoutTypeEnum)((int)type - 1);
+    }
+  }
+}
+
+void selectNextType()
+{
+  if (0 != selectedServo)
+  { 
+    auto type = servoData.servos[selectedServo-1].turnoutType;
+    if (4 > type)
+    {
+      servoData.servos[selectedServo-1].turnoutType = (turnoutTypeEnum)((int)type + 1);
+    }
+  }
+}
+
+void selectPrevMode()
+{
+  if (0 != selectedServo)
+  {
+    auto mode = servoData.servos[selectedServo-1].servoMode;
+    if (0 < mode)
+    { // fair enough
+      servoData.servos[selectedServo-1].servoMode = (servoModeEnum)((int)mode - 1);
+    }
+  }
+}
+
+void selectNextMode()
+{
+  if (0 != selectedServo)
+  {
+    auto mode = servoData.servos[selectedServo-1].servoMode;
+    if (3 > mode)
+    { // fair enough
+      servoData.servos[selectedServo-1].servoMode = (servoModeEnum)((int)mode + 1);
+    }
+  }
+}
+
+void pressedButton1()
+{
+  Serial.println("S1 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(1, servoPositionStraight, true);
+  }
+  else
+  {
+    switch (selectedPage)
+    {
+      case progPageServoLimits: modifySelServo(servoPositionStraight, true); break;
+      case progPageAdrDelta: modifyAdress(1); break;
+      case progPageTypeMode: selectPrevType(); break;
+    }
+  }
+}
+
+void pressedButton2()
+{
+  Serial.println("S2 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(1, servoPositionRound, true);
+  }
+  else
+  {
+    switch (selectedPage)
+    {
+      case progPageServoLimits: modifySelServo(servoPositionStraight, false); break;
+      case progPageAdrDelta: modifyAdress(-1); break;
+      case progPageTypeMode: selectNextType(); break;
+    }
+  }
+}
+
+void pressedButton3()
+{
+  Serial.println("S3 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(2, servoPositionStraight, true);
+  }
+  else
+  {
+    switch (selectedPage)
+    {
+      case progPageServoLimits: modifySelServo(servoPositionRound, true); break;
+      case progPageAdrDelta: modifyDeltaMove(1); break;
+      case progPageTypeMode: selectPrevMode(); break;
+    }
+  }
+}
+
+void pressedButton4()
+{
+  Serial.println("S4 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(2, servoPositionRound, true);
+  }
+  else
+  {
+    switch (selectedPage)
+    {
+      case progPageServoLimits: modifySelServo(servoPositionRound, false); break;
+      case progPageAdrDelta: modifyDeltaMove(1); break;
+      case progPageTypeMode: selectNextMode(); break;
+    }
+  }
+}
+
+void pressedButton5()
+{
+  Serial.println("S5 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(3, servoPositionStraight, true);
+  }
+  else
+  {
+    selectPrevPage();
+  }
+}
+
+void pressedButton6()
+{
+  Serial.println("S6 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(3, servoPositionRound, true);
+  }
+  else
+  {
+    selectNextPage();
+  }
+}
+
+void pressedButton7()
+{
+  Serial.println("S7 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(4, servoPositionStraight, true);
+    
+   }
+   else
+   { // reset
+     selectedServo = 0;
+     decoderState = stateIdle;
+     readFromEEprom();
+     fixServoPosition();
+   }
+}
+
+void pressedButton8()
+{
+  Serial.println("S8 pressed");
+  if (0 == selectedServo)
+  {
+    setSelectedServoPos(4, servoPositionRound, true);
+  }
+  else
+  {
+    // save
+    selectedServo = 0;
+    decoderState = stateIdle;
+    saveToEepromWheneverThereIsTime = true;
+  }
 }
 
 
@@ -1249,17 +1586,33 @@ void keyboardTask()
       // use macro
       if (success)
       {
-        DEBOUNCE_BUTTON(bitRead(buttons, 0), S1, Serial.println("S1 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, servoPositionStraight, true) : modifySelServo(servoPositionStraight, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 1), S2, Serial.println("S2 pressed"); (0 == selectedServo) ? setSelectedServoPos(1, servoPositionRound, true) : modifySelServo(servoPositionStraight, false))
-        DEBOUNCE_BUTTON(bitRead(buttons, 2), S3, Serial.println("S3 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, servoPositionStraight, true) : modifySelServo(servoPositionRound, true))
-        DEBOUNCE_BUTTON(bitRead(buttons, 3), S4, Serial.println("S4 pressed"); (0 == selectedServo) ? setSelectedServoPos(2, servoPositionRound, true) : modifySelServo(servoPositionRound, false))
-        DEBOUNCE_BUTTON(bitRead(buttons, 4), S5, Serial.println("S5 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, servoPositionStraight, true) : modifyDeltaMove(1))
-        DEBOUNCE_BUTTON(bitRead(buttons, 5), S6, Serial.println("S6 pressed"); (0 == selectedServo) ? setSelectedServoPos(3, servoPositionRound, true) : modifyDeltaMove(-1))
-        DEBOUNCE_BUTTON(bitRead(buttons, 6), S7, Serial.println("S7 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, servoPositionStraight, true) : modifyInitDelay(10))
-        DEBOUNCE_BUTTON(bitRead(buttons, 7), S8, Serial.println("S8 pressed"); (0 == selectedServo) ? setSelectedServoPos(4, servoPositionRound, true) : modifyInitDelay(-10))
+        DEBOUNCE_BUTTON( bitRead(buttons, 0), S1, pressedButton1(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 1), S2, pressedButton2(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 2), S3, pressedButton3(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 3), S4, pressedButton4(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 4), S5, pressedButton5(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 5), S6, pressedButton6(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 6), S7, pressedButton7(); )
+        DEBOUNCE_BUTTON( bitRead(buttons, 7), S8, pressedButton8(); )
       }
     #undef DEBOUNCE_BUTTON
     lastKeybTaskTime = millis();
+  }
+}
+
+void asyncMemoryTask()
+{
+  if (servoData.servos[0].moving || servoData.servos[1].moving || servoData.servos[2].moving || servoData.servos[3].moving)
+  {
+    return;
+  }
+  if ((millis() - lastAsyncMemoryTaskTime) > 1000)
+  {
+    if (saveToEepromWheneverThereIsTime)
+    {
+      saveToEEprom();
+      saveToEepromWheneverThereIsTime = false;
+    }
   }
 }
 
@@ -1283,7 +1636,7 @@ void setup()
   // init I2C
   scanI2CBus();
   //wait some defined time before servos are activated
-  delay(servoData.initDelay);
+  delay(initDelay);
   initialiseServos();
 }
 
@@ -1308,6 +1661,7 @@ void loop()
   CALL_TASK_WITH_STATS(displayTask);
   CALL_TASK_WITH_STATS(progButtonTask);
   CALL_TASK_WITH_STATS(keyboardTask);
+  CALL_TASK_WITH_STATS(asyncMemoryTask);
 
   // loop statistics
   loopOverallTimeMeas = micros() - loopOverallTimeMeas;
