@@ -48,9 +48,11 @@
 //     - add turnout type and care display
 //     - add servo mode, new menu structure
 //     - reduce code size
+//   2024_07_21 V1.3 EMM: some bugfixes
+//     - fix errorhandling, proceed with prog button in case
 //
 //******************************************************************************************************
-#define VERSION "v1.2"
+#define VERSION "v1.3"
 #define DESCSTR1 "DCC tournout decoder"
 #define DESCSTR2 "(c)EMM"
 
@@ -61,6 +63,9 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include "Statistic.h"
+
+#define MIN_SERVO_VALUE 700
+#define MAX_SERVO_VALUE 2300
 
 // configure the display (AZDelivery 0,96 Zoll OLED Display I2C SSD1306 Chip 128 x 64)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
@@ -377,24 +382,28 @@ void printServoData()
   }
 }
 
+bool rangeCheckMaxMin(int& nameOfValue, int minValue, int maxValue)
+{
+  bool modified = false; 
+  if (minValue > nameOfValue) { nameOfValue = minValue; modified = true; }
+  if (maxValue < nameOfValue) { nameOfValue = maxValue; modified = true; }
+  return modified;
+}
+
 void validateSettings()
 {
   if (0xAA == servoData.checkByte)
   {
     bool modified = false;
-    #define rangeCheckMaxMin(nameOfValue, minValue, maxValue)                      \
-      if (minValue > nameOfValue) { nameOfValue = minValue; modified = true; }     \
-      if (maxValue < nameOfValue) { nameOfValue = maxValue; modified = true; }
     for (int servoNumber = 0; servoNumber < 4; servoNumber++)
     {
-      rangeCheckMaxMin(servoData.servos[servoNumber].min, 1000, 2000);
-      rangeCheckMaxMin(servoData.servos[servoNumber].max, 1000, 2000);
-      rangeCheckMaxMin(servoData.servos[servoNumber].val, 1000, 2000);
+      modified = modified || rangeCheckMaxMin(servoData.servos[servoNumber].min, MIN_SERVO_VALUE, MAX_SERVO_VALUE);
+      modified = modified || rangeCheckMaxMin(servoData.servos[servoNumber].max, MIN_SERVO_VALUE, MAX_SERVO_VALUE);
+      rangeCheckMaxMin(servoData.servos[servoNumber].val, MIN_SERVO_VALUE, MAX_SERVO_VALUE);
     }
-    rangeCheckMaxMin(servoData.adress, 0, 50);
-    rangeCheckMaxMin(servoData.deltaMove, 5, 50);
-    rangeCheckMaxMin(servoData.initDelay, 1, 10000);
-    #undef rangeCheckMaxMin
+    modified = modified || rangeCheckMaxMin(servoData.adress, 0, 50);
+    modified = modified || rangeCheckMaxMin(servoData.deltaMove, 5, 50);
+    modified = modified || rangeCheckMaxMin(servoData.initDelay, 1, 10000);
     initDelay = servoData.initDelay;
     if (modified)
     {
@@ -1071,15 +1080,28 @@ void displayError()
 {
   u8g2.clearBuffer();
   u8g2.drawStr(0,  8, "ERROR:");
+  const char * string1 = "Read EEProm failed!";
+  const char * string2 = "Validation failed!";
+  const char * string3 = "Validation fixed!";
   switch (error)
   {
     default:
     case error_none:
       break;
-    case error_readEepromFailed: u8g2.drawStr(0,  30, "Read EEProm failed!"); break;
-    case error_validationFailed: u8g2.drawStr(0,  30, "Validation failed!"); break;
-    case error_validationFixed: u8g2.drawStr(0,  30, "Validation fixed!"); break;
+    case error_readEepromFailed:
+      u8g2.drawStr(0,  25, string1);
+      Serial.println(string1);
+      break;
+    case error_validationFailed:
+      u8g2.drawStr(0,  25, string2);
+      Serial.println(string2);
+      break;
+    case error_validationFixed:
+      u8g2.drawStr(0,  25, string3);
+      Serial.println(string3);
+      break;
   }
+  u8g2.drawStr(0,  40, "Prog to proceed!");
   u8g2.sendBuffer();
 }
 
@@ -1310,9 +1332,20 @@ void progButtonTask()
     progBtnPinActive = progBtnPinCount > DEBOUNCE_LEVEL;
     if (progBtnPinActive && (progBtnPinActive != progBtnPinActiveOld))
     {
-      careSelectedServo();
-      Serial.print("Prog -> SelServ=");
-      Serial.println(selectedServo);
+      if (error_none == error)
+      {
+        careSelectedServo();
+        Serial.print("Prog -> SelServ=");
+        Serial.println(selectedServo);
+      }
+      else if (error_validationFailed == error)
+      {
+        resetServoData();
+      }
+      else if (error_validationFixed == error)
+      {
+        saveToEEprom();
+      }
     }
     progBtnPinActiveOld = progBtnPinActive;
     lastProgBtnTaskTime = millis();
@@ -1334,6 +1367,8 @@ void modifySelServo(servoPosition pos, bool directionUp)
     {
       servoData.servos[selectedServo-1].min += delta;
     }
+    rangeCheckMaxMin(servoData.servos[selectedServo-1].min, MIN_SERVO_VALUE, MAX_SERVO_VALUE);
+    rangeCheckMaxMin(servoData.servos[selectedServo-1].max, MIN_SERVO_VALUE, MAX_SERVO_VALUE);
   }
   setSelectedServoPos(selectedServo, pos, false);
   lastPos = pos;
